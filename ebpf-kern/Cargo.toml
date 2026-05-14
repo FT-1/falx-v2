@@ -22,14 +22,9 @@ path              = "src/main.rs"
 aya-ebpf          = { workspace = true }
 aya-log-ebpf      = { workspace = true }
 
-[profile.release]
-opt-level         = 3
-lto               = true
-panic             = "abort"   # Required for BPF target - no unwinding
-codegen-units     = 1
-
-[profile.dev]
-panic             = "abort"   # Also required in dev for BPF
+# NOTE: build profiles (release / dev) are intentionally NOT defined here.
+# Cargo rejects them inside workspace members with a warning. They live in
+# the workspace root Cargo.toml (../Cargo.toml) and apply to this crate too.
 
 # ─── Build target override for BPF ───────────────────────────────────────────
 # Build with: cargo build --target bpfel-unknown-none -Z build-std=core

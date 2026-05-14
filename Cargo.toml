@@ -34,3 +34,24 @@ libc            = { version = "0.2"  }
 version         = "0.1.0"
 architect       = "FT-1"
 project         = "FALX V2"
+
+# ─── Build Profiles (workspace-level — required by Cargo) ────────────────────
+# Cargo emits a warning when profiles are defined inside a member crate:
+#   "profiles for the non root package will be ignored, specify profiles at
+#    the workspace root"
+# Moving them here silences the warning AND ensures the same profile applies
+# to all workspace members (ebpf-kern, ebpf-user).
+# panic = "abort" is REQUIRED for the BPF target — there is no unwinder in BPF.
+[profile.release]
+opt-level     = 3
+lto           = true
+panic         = "abort"
+codegen-units = 1
+# IMPORTANT: do NOT set `strip = true` here. For the BPF target, stripping
+# can remove the .BTF section that the kernel verifier needs for type-aware
+# error messages and that aya-log relies on. `debug = false` (the default
+# for release) is fine; explicit stripping is not.
+
+[profile.dev]
+panic         = "abort"
+opt-level     = 0

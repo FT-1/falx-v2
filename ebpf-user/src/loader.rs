@@ -19,9 +19,15 @@ use aya::{
     // aya 0.13 exposes ONE user-space `HashMap` type that works for both
     // regular BPF_MAP_TYPE_HASH and BPF_MAP_TYPE_LRU_HASH kernel maps —
     // the underlying kernel map type was already fixed at program load time
-    // (via the #[map] attribute in ebpf-kern), so no HashMap distinction
-    // is needed on the user side.
-    maps::{Array, HashMap, PerCpuArray},
+    // (via the #[map] attribute in ebpf-kern), so no LruHashMap variant
+    // exists on the user side.
+    //
+    // The `Map` enum is required when opening a pinned map: aya 0.13 only
+    // implements `TryFrom<Map>` (not `TryFrom<MapData>`) for the typed map
+    // wrappers, so each pinned `MapData` must be wrapped in its correct
+    // enum variant (e.g. `Map::LruHashMap(...)`, `Map::Array(...)`) before
+    // being converted into the strongly-typed view.
+    maps::{Array, HashMap, Map, PerCpuArray},
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
@@ -217,7 +223,8 @@ impl MapManager {
         MapManager { pin_path }
     }
 
-    /// Add or update an IPv4 block entry
+    /// Add or update an IPv4 block entry.
+    /// Kernel-side map type: LruHashMap → must wrap in `Map::LruHashMap`.
     pub fn block_ipv4(
         &self,
         src_ip:   u32,
@@ -228,8 +235,9 @@ impl MapManager {
         let pin = self.pin_path.join("blocklist_v4");
         let map_data = MapData::from_pin(&pin)
             .context("Failed to open BLOCKLIST_V4 from pin")?;
+        let map_wrapped = Map::LruHashMap(map_data);
         let mut map: HashMap<_, u32, crate::types::BlockEntry> =
-            HashMap::try_from(map_data)?;
+            HashMap::try_from(map_wrapped)?;
 
         map.insert(src_ip, entry, 0)
             .context("Failed to insert blocklist entry")?;
@@ -238,15 +246,17 @@ impl MapManager {
         Ok(())
     }
 
-    /// Remove an IPv4 block entry
+    /// Remove an IPv4 block entry.
+    /// Kernel-side map type: LruHashMap → must wrap in `Map::LruHashMap`.
     pub fn unblock_ipv4(&self, src_ip: u32) -> Result<()> {
         use aya::maps::MapData;
 
         let pin = self.pin_path.join("blocklist_v4");
         let map_data = MapData::from_pin(&pin)
             .context("Failed to open BLOCKLIST_V4 from pin")?;
+        let map_wrapped = Map::LruHashMap(map_data);
         let mut map: HashMap<_, u32, crate::types::BlockEntry> =
-            HashMap::try_from(map_data)?;
+            HashMap::try_from(map_wrapped)?;
 
         map.remove(&src_ip)
             .context("Failed to remove blocklist entry")?;
@@ -255,7 +265,8 @@ impl MapManager {
         Ok(())
     }
 
-    /// Read aggregated stats from XDP_STATS PerCpuArray
+    /// Read aggregated stats from XDP_STATS PerCpuArray.
+    /// Kernel-side map type: PerCpuArray → must wrap in `Map::PerCpuArray`.
     pub fn read_stats(&self) -> Result<crate::types::XdpStats> {
         use aya::maps::MapData;
         use crate::types::XdpStats;
@@ -263,7 +274,8 @@ impl MapManager {
         let pin = self.pin_path.join("xdp_stats");
         let map_data = MapData::from_pin(&pin)
             .context("Failed to open XDP_STATS from pin")?;
-        let map: PerCpuArray<_, XdpStats> = PerCpuArray::try_from(map_data)?;
+        let map_wrapped = Map::PerCpuArray(map_data);
+        let map: PerCpuArray<_, XdpStats> = PerCpuArray::try_from(map_wrapped)?;
 
         // PerCpuArray returns a PerCpuValues vec — aggregate across CPUs
         let per_cpu = map.get(&0, 0)
@@ -273,14 +285,16 @@ impl MapManager {
         Ok(aggregated)
     }
 
-    /// Update runtime config without reloading the BPF program
+    /// Update runtime config without reloading the BPF program.
+    /// Kernel-side map type: Array → must wrap in `Map::Array`.
     pub fn update_config(&self, config: FalxMapConfig) -> Result<()> {
         use aya::maps::MapData;
 
         let pin = self.pin_path.join("config");
         let map_data = MapData::from_pin(&pin)
             .context("Failed to open CONFIG from pin")?;
-        let mut map: Array<_, FalxMapConfig> = Array::try_from(map_data)?;
+        let map_wrapped = Map::Array(map_data);
+        let mut map: Array<_, FalxMapConfig> = Array::try_from(map_wrapped)?;
 
         map.set(0, config, 0)
             .context("Failed to update CONFIG map")?;
@@ -289,14 +303,16 @@ impl MapManager {
         Ok(())
     }
 
-    /// Close the circuit breaker (re-enable AI path)
+    /// Close the circuit breaker (re-enable AI path).
+    /// Kernel-side map type: Array → must wrap in `Map::Array`.
     pub fn close_circuit(&self) -> Result<()> {
         use aya::maps::MapData;
 
         let pin = self.pin_path.join("failsafe_state");
         let map_data = MapData::from_pin(&pin)
             .context("Failed to open FAILSAFE_STATE from pin")?;
-        let mut map: Array<_, FailsafeState> = Array::try_from(map_data)?;
+        let map_wrapped = Map::Array(map_data);
+        let mut map: Array<_, FailsafeState> = Array::try_from(map_wrapped)?;
 
         let mut state = map.get(&0, 0)
             .context("Failed to read FAILSAFE_STATE")?;

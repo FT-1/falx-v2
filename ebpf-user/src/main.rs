@@ -10,6 +10,13 @@
 //                - Runs stats polling loop with graceful shutdown
 // =============================================================================
 
+// Crate-level lint configuration.
+// loader.rs exposes a `MapManager` helper with convenience methods (block_ipv4,
+// unblock_ipv4, read_stats, update_config, close_circuit) used by the control
+// plane via FFI. Not every method is called from this crate's `main.rs`, so
+// `dead_code` warnings would otherwise be emitted for the unused ones.
+#![allow(dead_code)]
+
 mod loader;
 mod types;
 

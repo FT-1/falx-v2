@@ -25,6 +25,22 @@
 #![no_std]
 #![no_main]
 
+// ─── Crate-level lint configuration ──────────────────────────────────────────
+// `dead_code`: types.rs and parser.rs define a number of constants/helpers
+// (action::RATE_LIMIT, reason::*, proto::ICMP/ICMPV6/ARP, tcp_flags::*,
+// ntohl/htonl, is_syn_ack) that are reserved for Phase 9+ (AI verdict path
+// and TCP-flag-based heuristics). They are intentional, not stale code.
+//
+// `static_mut_refs`: Aya's `#[map]` proc-macro generates `pub static mut MAP`
+// declarations, and `unsafe { MAP.get(...) }` is the documented API for
+// reading them. The Rust 2024 compatibility lint flags this pattern as
+// dangerous in general, but for BPF map handles the kernel verifier
+// enforces safety — there are no mutable references on the user-visible
+// side. Aya is tracking the 2024-edition migration upstream; until then
+// we silence the lint at crate level.
+#![allow(dead_code)]
+#![allow(static_mut_refs)]
+
 mod types;
 mod maps;
 mod parser;
