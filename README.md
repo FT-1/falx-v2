@@ -200,7 +200,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 
 rustup toolchain install nightly --component rust-src
-rustup target add bpfel-unknown-none
+rustup target add bpfel-unknown-none --toolchain nightly
 cargo install bpf-linker
 
 rustup show    # تحقق أن nightly + bpfel-unknown-none مثبّتَين
@@ -452,6 +452,117 @@ curl -s http://localhost:8080/healthz | jq
 
 ---
 
+## API Reference
+
+جدول شامل لجميع endpoints مرتبة حسب المجموعة الوظيفية.
+
+> Auth Required: جميع الـ endpoints تتطلب `Authorization: Bearer <JWT>` ما عدا `/api/v1/auth/*` و `/healthz`.
+
+### Authentication
+
+| Method | Path | Auth | Role | Description |
+|---|---|:---:|---|---|
+| `POST` | `/api/v1/auth/login` | No | — | تسجيل الدخول — يُعيد access token + refresh token |
+| `POST` | `/api/v1/auth/refresh` | No | — | تجديد الـ access token باستخدام refresh token |
+| `POST` | `/api/v1/auth/logout` | Yes | Any | إلغاء الـ refresh token الحالي |
+| `POST` | `/api/v1/auth/totp/setup` | Yes | Any | إنشاء TOTP secret + QR code |
+| `POST` | `/api/v1/auth/totp/verify` | Yes | Any | التحقق من TOTP وتفعيله |
+| `POST` | `/api/v1/auth/change-password` | Yes | Any | تغيير كلمة المرور |
+
+### Security — Block/Unblock
+
+| Method | Path | Auth | Role | Description |
+|---|---|:---:|---|---|
+| `POST` | `/api/v1/security/block` | Yes | Senior Analyst+ | حظر IP (دائم أو مؤقت بـ `ttl_s`) |
+| `DELETE` | `/api/v1/security/block/:ip` | Yes | Senior Analyst+ | إلغاء حظر IP |
+| `GET` | `/api/v1/security/blocklist` | Yes | Viewer+ | قائمة الـ IPs المحظورة مع metadata |
+| `GET` | `/api/v1/security/stats` | Yes | Viewer+ | XDP counters: passed / dropped / rate-limited |
+
+### Failsafe — Circuit Breaker
+
+| Method | Path | Auth | Role | Description |
+|---|---|:---:|---|---|
+| `GET` | `/api/v1/failsafe` | Yes | Viewer+ | حالة قاطع الدائرة (open/closed/half-open) |
+| `POST` | `/api/v1/failsafe/open` | Yes | Senior Analyst+ | فتح القاطع يدوياً (bypass mode) |
+| `POST` | `/api/v1/failsafe/close` | Yes | Admin+ | إعادة تشغيل الحماية |
+| `GET` | `/api/v1/failsafe/events` | Yes | Viewer+ | سجل أحداث قاطع الدائرة |
+
+### Policy Rules
+
+| Method | Path | Auth | Role | Description |
+|---|---|:---:|---|---|
+| `GET` | `/api/v1/policy/rules` | Yes | Viewer+ | عرض كل القواعد |
+| `POST` | `/api/v1/policy/rules` | Yes | Senior Analyst+ | إضافة قاعدة جديدة |
+| `PUT` | `/api/v1/policy/rules/:id` | Yes | Senior Analyst+ | تعديل قاعدة |
+| `DELETE` | `/api/v1/policy/rules/:id` | Yes | Admin+ | حذف قاعدة |
+| `POST` | `/api/v1/policy/rules/:id/toggle` | Yes | Senior Analyst+ | تفعيل / تعطيل قاعدة |
+
+### User Management
+
+| Method | Path | Auth | Role | Description |
+|---|---|:---:|---|---|
+| `GET` | `/api/v1/users` | Yes | Admin+ | قائمة المستخدمين |
+| `POST` | `/api/v1/users` | Yes | Admin+ | إنشاء مستخدم جديد |
+| `PUT` | `/api/v1/users/:id` | Yes | Admin+ | تعديل بيانات مستخدم |
+| `DELETE` | `/api/v1/users/:id` | Yes | Super Admin | حذف مستخدم |
+| `POST` | `/api/v1/users/:id/role` | Yes | Super Admin | تعيين دور |
+| `POST` | `/api/v1/users/:id/unlock` | Yes | Admin+ | فك قفل الحساب بعد lockout |
+
+### Audit & Events
+
+| Method | Path | Auth | Role | Description |
+|---|---|:---:|---|---|
+| `GET` | `/api/v1/audit` | Yes | Senior Analyst+ | سجل العمليات الحساسة (paginated) |
+| `GET` | `/api/v1/events/stream` | Yes | Viewer+ | WebSocket stream للأحداث الحية |
+
+### System
+
+| Method | Path | Auth | Role | Description |
+|---|---|:---:|---|---|
+| `GET` | `/healthz` | No | — | فحص صحة الخدمة (يُستخدم من Docker HEALTHCHECK) |
+| `GET` | `/metrics` | No | — | Prometheus metrics endpoint |
+
+---
+
+## Prometheus Metrics
+
+يُصدر falxd على المنفذ `:9090/metrics` مجموعة من الـ metrics القياسية.
+
+### Counters
+
+| Metric | Labels | Description |
+|---|---|---|
+| `falx_packets_total` | `verdict={passed,dropped,rate_limited,redirected}` | عدد الحزم المُعالجة منذ بدء التشغيل |
+| `falx_bpf_map_writes_total` | `map={blocklist,rate_limiter,failsafe_state,...}` | عدد عمليات الكتابة على كل BPF map |
+| `falx_policy_evaluations_total` | `result={match,no_match}` | عدد مرات تقييم قواعد الـ policy engine |
+| `falx_auth_attempts_total` | `result={success,failure,locked}` | محاولات المصادقة |
+| `falx_ipc_messages_total` | `direction={recv,sent}`, `type` | رسائل بروتوكول FLX2 على الـ Unix socket |
+
+### Gauges
+
+| Metric | Labels | Description |
+|---|---|---|
+| `falx_circuit_breaker_state` | — | حالة قاطع الدائرة: `0`=closed (طبيعي), `1`=open (bypass), `2`=half-open |
+| `falx_blocklist_size` | — | عدد الـ IPs المحظورة حالياً في BPF map |
+| `falx_active_connections` | `source={soc,ai}` | الاتصالات النشطة على Unix socket |
+
+### Histograms
+
+| Metric | Labels | Description |
+|---|---|---|
+| `falx_bpf_map_write_duration_seconds` | `map` | توزيع زمن استجابة عمليات الكتابة على الـ maps |
+| `falx_policy_evaluation_duration_seconds` | — | توزيع زمن تقييم القواعد |
+
+```bash
+# استعراض كل الـ metrics
+curl -s http://localhost:9090/metrics | grep '^falx_'
+
+# مثال: مجموع الحزم المحظورة
+curl -s http://localhost:9090/metrics | grep 'falx_packets_total{verdict="dropped"}'
+```
+
+---
+
 ## الأدوار والصلاحيات (RBAC)
 
 | الدور | Block IP | Block Temp | Policies | Users | Failsafe | Audit |
@@ -572,6 +683,26 @@ sudo systemctl restart falxd
 docker run --ulimit memlock=-1:-1 ...
 ```
 
+### أخطاء XDP mode شائعة
+
+| الخطأ | السبب | الحل |
+|---|---|---|
+| `XDP_FLAGS_DRV_MODE: invalid argument` | الـ driver لا يدعم native XDP | غيّر إلى `mode = "skb"` في falx.toml |
+| `bind: cannot assign requested address` | رقم queue channel غير متاح | تحقق: `ethtool -l eth0` وعدّل `queue_id` |
+| `failed to create UMEM` | حجم UMEM أكبر من `RLIMIT_MEMLOCK` | `ulimit -l unlimited` أو `LimitMEMLOCK=infinity` في systemd unit |
+| `xdp_attach: device busy` | XDP program آخر مُركَّب على الواجهة | `sudo ip link set eth0 xdpdrv off` ثم أعد التشغيل |
+| `AF_XDP socket: operation not supported` | kernel < 4.18 | ترقية الـ kernel، الحد الأدنى 5.15 |
+
+### أخطاء BPF loading
+
+| الخطأ | السبب | الحل |
+|---|---|---|
+| `libbpf: failed to load object` | kernel لا يدعم BTF | `CONFIG_DEBUG_INFO_BTF=y` مطلوب في kernel config |
+| `permission denied (EPERM) loading BPF` | غياب `CAP_BPF` | أضف capability: `sudo setcap cap_bpf+ep /usr/local/bin/falxd` |
+| `verifier log: invalid mem access` | حجم BPF stack تجاوز 512 bytes | تحقق من تغييرات أخيرة في `ebpf-kern/src/` |
+| `map_create: too many open files` | تجاوز `RLIMIT_NOFILE` | أضف `LimitNOFILE=65536` في systemd unit |
+| `BTF not found` | ملف `.bpf.o` لا يحتوي BTF section | أعد البناء بـ `RUSTFLAGS="-C debuginfo=2"` |
+
 ### SOC Backend لا يتصل بـ falxd
 
 ```bash
@@ -600,16 +731,35 @@ getcap /usr/local/bin/falxd
 # عرض الـ maps المحمّلة
 sudo bpftool map show | grep falx
 
-# البحث عن IP في blocklist
+# البحث عن IP في blocklist (1.2.3.4)
 sudo bpftool map lookup \
     pinned /sys/fs/bpf/falx/blocklist_v4 \
-    key hex $(printf '%02x %02x %02x %02x' 1 2 3 4)   # 1.2.3.4
+    key hex $(printf '%02x %02x %02x %02x' 1 2 3 4)
 
-# عرض Failsafe state
+# عرض كل الـ IPs المحظورة
+sudo bpftool map dump pinned /sys/fs/bpf/falx/blocklist_v4
+
+# حذف IP من blocklist يدوياً (تجاوز الـ API)
+sudo bpftool map delete \
+    pinned /sys/fs/bpf/falx/blocklist_v4 \
+    key hex $(printf '%02x %02x %02x %02x' 1 2 3 4)
+
+# عرض Rate Limiter state لـ IP
+sudo bpftool map lookup \
+    pinned /sys/fs/bpf/falx/rate_limiter \
+    key hex $(printf '%02x %02x %02x %02x' 1 2 3 4)
+
+# عرض Failsafe state (0=closed, 1=open, 2=half-open)
 sudo bpftool map dump pinned /sys/fs/bpf/falx/failsafe_state
 
-# عرض XDP stats
+# عرض XDP packet counters
 sudo bpftool map dump pinned /sys/fs/bpf/falx/xdp_stats
+
+# مراقبة XDP stats بشكل مستمر (كل ثانية)
+watch -n1 'sudo bpftool map dump pinned /sys/fs/bpf/falx/xdp_stats'
+
+# التحقق من BPF program المُحمَّل على الواجهة
+sudo bpftool net show dev eth0
 ```
 
 ---

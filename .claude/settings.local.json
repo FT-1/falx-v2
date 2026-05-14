@@ -4,7 +4,17 @@
       "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\FT0\\\\Desktop\\\\falx-v2\\\\falx-v2\" -Force)",
       "Bash(Select-Object Name, Mode)",
       "Bash(Test-Path \"c:\\\\Users\\\\FT0\\\\Desktop\\\\falx-v2\\\\falx-v2\\\\docker\\\\Dockerfile.ai\")",
-      "Bash(xxd)"
+      "Bash(xxd)",
+      "Bash(cp -r control-plane/internal/auth          control-plane/pkg/auth)",
+      "Bash(cp -r control-plane/internal/bpfmaps       control-plane/pkg/bpfmaps)",
+      "Bash(cp -r control-plane/internal/events        control-plane/pkg/events)",
+      "Bash(cp -r control-plane/internal/notifications control-plane/pkg/notifications)",
+      "Bash(cp -r control-plane/internal/policy        control-plane/pkg/policy)",
+      "Bash(xargs sed -i -e 's|github\\\\.com/ft-1/falx-v2/control-plane/internal/auth|github.com/ft-1/falx-v2/control-plane/pkg/auth|g' -e 's|github\\\\.com/ft-1/falx-v2/control-plane/internal/bpfmaps|github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps|g' -e 's|github\\\\.com/ft-1/falx-v2/control-plane/internal/events|github.com/ft-1/falx-v2/control-plane/pkg/events|g' -e 's|github\\\\.com/ft-1/falx-v2/control-plane/internal/notifications|github.com/ft-1/falx-v2/control-plane/pkg/notifications|g' -e 's|github\\\\.com/ft-1/falx-v2/control-plane/internal/policy|github.com/ft-1/falx-v2/control-plane/pkg/policy|g')",
+      "Bash(sed -i '/^COPY --from=builder \\\\/build\\\\/ai-inference\\\\/build\\\\/falx-ai/i # Non-root system user — security hardening\\\\nRUN groupadd -r -g 1002 falxai \\\\&\\\\& useradd -r -u 1002 -g falxai -s /sbin/nologin falxai\\\\n\\\\nRUN install -d -m 750 -o falxai -g falxai /var/run/falx /opt/falx/models\\\\n' docker/Dockerfile.ai)",
+      "Bash(sed -i 's|^COPY --from=builder /build/ai-inference/build/falx-ai /usr/local/bin/falx-ai|COPY --from=builder --chown=falxai:falxai /build/ai-inference/build/falx-ai /usr/local/bin/falx-ai|' docker/Dockerfile.ai)",
+      "Bash(sed -i '/^RUN install -d -m 750 \\\\/var\\\\/run\\\\/falx \\\\/opt\\\\/falx\\\\/models$/d' docker/Dockerfile.ai)",
+      "Bash(sed -i '/^ENV FALX_AI_SOCKET/i USER falxai\\\\n' docker/Dockerfile.ai)"
     ]
   }
 }

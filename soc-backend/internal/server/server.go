@@ -14,6 +14,7 @@
 //     POST /api/v1/auth/logout-all      → AuthHandler.LogoutAll
 //     GET  /api/v1/auth/me              → AuthHandler.Me
 //     PUT  /api/v1/auth/me/password     → AuthHandler.ChangePassword
+//     GET  /api/v1/auth/roles           → AuthHandler.ListRoles [viewer+] (SEC-FIX-001)
 //     GET  /api/v1/dashboard            → DashboardHandler.Overview  [viewer+]
 //     GET  /api/v1/dashboard/stats      → DashboardHandler.Stats     [viewer+]
 //     GET  /api/v1/dashboard/threats    → DashboardHandler.Threats   [analyst+]
@@ -64,11 +65,11 @@ import (
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 
-	authpkg   "github.com/ft-1/falx-v2/control-plane/internal/auth"
-	"github.com/ft-1/falx-v2/control-plane/internal/bpfmaps"
-	"github.com/ft-1/falx-v2/control-plane/internal/events"
-	"github.com/ft-1/falx-v2/control-plane/internal/notifications"
-	"github.com/ft-1/falx-v2/control-plane/internal/policy"
+	authpkg   "github.com/ft-1/falx-v2/control-plane/pkg/auth"
+	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
+	"github.com/ft-1/falx-v2/control-plane/pkg/events"
+	"github.com/ft-1/falx-v2/control-plane/pkg/notifications"
+	"github.com/ft-1/falx-v2/control-plane/pkg/policy"
 	"github.com/ft-1/falx-v2/soc-backend/internal/api"
 )
 
@@ -199,7 +200,9 @@ func (s *Server) buildRouter() http.Handler {
 	pub := r.PathPrefix("/api/v1/auth").Subrouter()
 	pub.HandleFunc("/login",   authH.Login).Methods(http.MethodPost)
 	pub.HandleFunc("/refresh", authH.RefreshTokens).Methods(http.MethodPost)
-	pub.HandleFunc("/roles",   authH.ListRoles).Methods(http.MethodGet)
+	// SEC-FIX-001: /roles moved to authenticated subrouter — listing all roles
+	// and their permissions is internal information that must not be public.
+	// OWASP API3:2023 Broken Object Property Level Authorization.
 
 	// ── Authenticated: all roles ──────────────────────────────────────────
 	authed := r.PathPrefix("/api/v1").Subrouter()
@@ -209,6 +212,8 @@ func (s *Server) buildRouter() http.Handler {
 	authed.HandleFunc("/auth/logout-all",    authH.LogoutAll).Methods(http.MethodPost)
 	authed.HandleFunc("/auth/me",            authH.Me).Methods(http.MethodGet)
 	authed.HandleFunc("/auth/me/password",   authH.ChangePassword).Methods(http.MethodPut)
+	// SEC-FIX-001: /roles requires authentication (viewer+)
+	authed.HandleFunc("/auth/roles",         authH.ListRoles).Methods(http.MethodGet)
 
 	// Dashboard — viewer+
 	viewerPerm := auth.RequirePermission(authpkg.PermDashboardView)

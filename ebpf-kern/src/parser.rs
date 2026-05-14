@@ -222,6 +222,23 @@ pub mod tcp_flags {
     }
 }
 
+// ─── Mutable Pointer Accessor (for in-place packet rewriting) ─────────────────
+// Required by honeypot.rs for XDP_TX header rewriting.
+// Identical bounds-check logic to ptr_at() but returns *mut T.
+// The BPF verifier tracks mutability; this is ONLY used on packets that
+// are about to be XDP_TX'd (never on packets passed to the network stack).
+#[inline(always)]
+pub unsafe fn ptr_at_mut<T>(ctx: &XdpContext, offset: usize) -> Result<*mut T, ()> {
+    let start = ctx.data();
+    let end   = ctx.data_end();
+    let len   = mem::size_of::<T>();
+
+    if start + offset + len > end {
+        return Err(());
+    }
+    Ok((start + offset) as *mut T)
+}
+
 // ─── IP Helper: Convert network-order u32 to host-order ──────────────────────
 #[inline(always)]
 pub fn ntohl(x: u32) -> u32 {

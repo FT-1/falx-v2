@@ -16,7 +16,6 @@
 package bpfmaps
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"time"

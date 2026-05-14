@@ -23,7 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
-	"github.com/ft-1/falx-v2/control-plane/internal/bpfmaps"
+	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
 	"github.com/ft-1/falx-v2/control-plane/internal/failsafe"
 )
 

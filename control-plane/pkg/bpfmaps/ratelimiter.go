@@ -17,7 +17,6 @@
 package bpfmaps
 
 import (
-	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"

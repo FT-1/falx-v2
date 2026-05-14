@@ -51,7 +51,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/ft-1/falx-v2/control-plane/internal/afxdp"
-	"github.com/ft-1/falx-v2/control-plane/internal/bpfmaps"
+	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
 	"github.com/ft-1/falx-v2/control-plane/internal/failsafe"
 	"github.com/ft-1/falx-v2/control-plane/internal/honeypot"
 	"github.com/ft-1/falx-v2/control-plane/internal/metrics"
@@ -61,6 +61,11 @@ import (
 type FalxDaemon struct {
 	cfg  *FalxConfig
 	log  *zap.Logger
+
+	// rootCtx is the top-level context derived from Run's parentCtx.
+	// Stored here so sub-initializers (e.g. initBPFMaps) can derive children
+	// without needing context.Background() — ensuring all goroutines stop on SIGTERM.
+	rootCtx context.Context
 
 	// Subsystem handles (built during Run, used during shutdown)
 	bpfMgr       *bpfmaps.Manager
@@ -91,6 +96,9 @@ func (d *FalxDaemon) Run(parentCtx context.Context) error {
 	// Top-level context: cancelled on SIGINT/SIGTERM
 	ctx, rootCancel := context.WithCancel(parentCtx)
 	defer rootCancel()
+
+	// Store root context so sub-initializers can derive from it correctly.
+	d.rootCtx = ctx
 
 	// ── [1] BPF Map Manager ───────────────────────────────────────────────
 	if err := d.initBPFMaps(); err != nil {
@@ -192,9 +200,9 @@ func (d *FalxDaemon) initBPFMaps() error {
 	}
 	d.bpfMgr = mgr
 
-	// Start TTL expiry daemon
+	// Start TTL expiry daemon — use the root daemon context so it stops on SIGTERM.
 	expiry := bpfmaps.NewExpiryDaemon(mgr, 60*time.Second, d.log)
-	expiryCtx, cancel := context.WithCancel(context.Background())
+	expiryCtx, cancel := context.WithCancel(d.rootCtx)
 	d.cancelFuncs = append(d.cancelFuncs, cancel)
 	go expiry.Run(expiryCtx)
 
@@ -262,16 +270,27 @@ func (d *FalxDaemon) initFailsafe(ctx context.Context) {
 		}
 	}()
 
-	// Forward circuit breaker transitions to audit log
+	// Forward circuit breaker transitions to audit log.
+	// Uses select with ctx.Done() so the goroutine exits cleanly when the
+	// failsafe context is cancelled — avoids goroutine leak if the channel
+	// is never closed (e.g. engine exits via error before draining).
 	go func() {
-		for t := range d.fsEngine.Transitions {
-			d.log.Warn("Circuit breaker transition",
-				zap.String("from",   t.From.String()),
-				zap.String("to",     t.To.String()),
-				zap.String("reason", t.Reason),
-				zap.Uint64("pps",    t.CurrentPPS),
-				zap.Int("trips",     t.TripCount),
-			)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case t, ok := <-d.fsEngine.Transitions:
+				if !ok {
+					return
+				}
+				d.log.Warn("Circuit breaker transition",
+					zap.String("from",   t.From.String()),
+					zap.String("to",     t.To.String()),
+					zap.String("reason", t.Reason),
+					zap.Uint64("pps",    t.CurrentPPS),
+					zap.Int("trips",     t.TripCount),
+				)
+			}
 		}
 	}()
 
@@ -414,16 +433,28 @@ func (d *FalxDaemon) dumpStats() {
 }
 
 // ─── Graceful Shutdown ────────────────────────────────────────────────────────
+// shutdown cancels all subsystem contexts in reverse dependency order, then
+// waits up to shutdownDrainTimeout for them to finish. Subsystems that embed
+// their own sync.WaitGroup (e.g. AF_XDP bridge) are joined via their Close()
+// deferred in Run(). The drain timer is a safety net for subsystems that only
+// observe context cancellation without an exposed WaitGroup.
+const shutdownDrainTimeout = 5 * time.Second
+
 func (d *FalxDaemon) shutdown() {
 	d.log.Warn("Initiating graceful shutdown...")
 
-	// Cancel all subsystem contexts in reverse order
+	// Cancel all subsystem contexts in reverse dependency order.
 	for i := len(d.cancelFuncs) - 1; i >= 0; i-- {
 		d.cancelFuncs[i]()
 	}
 
-	// Allow subsystems time to drain
-	time.Sleep(500 * time.Millisecond)
+	// Wait for the drain timeout. Subsystems with internal WaitGroups
+	// (bridge, metrics server) will drain via their deferred Close() calls
+	// in Run(). This sleep is a bounded safety net for goroutines that
+	// only poll ctx.Done() on a ticker (e.g. honeypot manager, expiry daemon).
+	drainTimer := time.NewTimer(shutdownDrainTimeout)
+	defer drainTimer.Stop()
+	<-drainTimer.C
 
 	d.log.Info("FALX V2 shutdown complete.")
 }

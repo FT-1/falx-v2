@@ -147,6 +147,8 @@ fn pin_maps(ebpf: &mut Ebpf, pin_base: &Path) -> Result<()> {
         "FAILSAFE_STATE",
         "CONFIG",
         "XSK_MAP",
+        "HONEYPOT_TARGETS",
+        "HONEYPOT_ACTIVE",
     ];
 
     for map_name in &maps_to_pin {

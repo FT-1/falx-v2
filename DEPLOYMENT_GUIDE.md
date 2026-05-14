@@ -54,7 +54,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --profile minimal --default-toolchain nightly
 source ~/.cargo/env
 
-rustup target add bpfel-unknown-none
+rustup target add bpfel-unknown-none --toolchain nightly
 rustup component add rust-src --toolchain nightly
 cargo install bpf-linker
 

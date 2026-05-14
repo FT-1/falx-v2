@@ -19,7 +19,7 @@ import (
 
 	"go.uber.org/zap"
 
-	authpkg "github.com/ft-1/falx-v2/control-plane/internal/auth"
+	authpkg "github.com/ft-1/falx-v2/control-plane/pkg/auth"
 )
 
 // ─── Test Helpers ─────────────────────────────────────────────────────────────

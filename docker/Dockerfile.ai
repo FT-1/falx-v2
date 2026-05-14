@@ -18,7 +18,7 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     nlohmann-json3-dev \
     libspdlog-dev \
     libfmt-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
@@ -41,11 +41,17 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     libspdlog1.10 \
     libfmt9 \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/ai-inference/build/falx-ai /usr/local/bin/falx-ai
+# Non-root system user — security hardening
+RUN groupadd -r -g 1002 falxai && useradd -r -u 1002 -g falxai -s /sbin/nologin falxai
 
-RUN install -d -m 750 /var/run/falx /opt/falx/models
+RUN install -d -m 750 -o falxai -g falxai /var/run/falx /opt/falx/models
+
+COPY --from=builder --chown=falxai:falxai /build/ai-inference/build/falx-ai /usr/local/bin/falx-ai
+
+
+USER falxai
 
 ENV FALX_AI_SOCKET="/var/run/falx/ai.sock" \
     FALX_AI_BLOCK_THRESHOLD="0.85" \

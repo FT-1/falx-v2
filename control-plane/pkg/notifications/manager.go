@@ -27,7 +27,7 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
-	"github.com/ft-1/falx-v2/control-plane/internal/events"
+	"github.com/ft-1/falx-v2/control-plane/pkg/events"
 )
 
 // ─── Channel Interface ────────────────────────────────────────────────────────

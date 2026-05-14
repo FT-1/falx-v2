@@ -1,6 +1,8 @@
 // =============================================================================
 // Project: FALX V2
 // Lead Architect & Owner: FT-1
+// SEC-FIX-003: pathParam now uses gorilla/mux vars — fixes route confusion bypass.
+// SEC-FIX-005: userIDFromContext uses typed context key to match auth middleware.
 // Description: Policy HTTP handlers (control-plane/internal/policy/handlers.go).
 //              REST API for dynamic rule management.
 //
@@ -22,10 +24,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
+	"github.com/gorilla/mux"
 	"go.uber.org/zap"
+
+	authpkg "github.com/ft-1/falx-v2/control-plane/pkg/auth"
 )
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
@@ -232,20 +236,27 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v interface{}) bool {
 	return true
 }
 
+// pathParam extracts a named route variable using gorilla/mux.
+// SEC-FIX-003: previously used strings.Split on r.URL.Path which is trivially
+// confused by trailing slashes and path traversal — mux.Vars is authoritative.
+// OWASP A01:2021 Broken Access Control.
 func pathParam(r *http.Request) string {
-	parts := strings.Split(strings.TrimSuffix(r.URL.Path, "/"), "/")
-	if len(parts) > 0 {
-		return parts[len(parts)-1]
+	if vars := mux.Vars(r); len(vars) > 0 {
+		// The route variable for rule identifiers is always "id".
+		if id, ok := vars["id"]; ok {
+			return id
+		}
 	}
 	return ""
 }
 
+// userIDFromContext retrieves the actor user ID injected by the auth middleware.
+// SEC-FIX-005: delegates to auth.UserIDFromContext which uses the same typed
+// contextKey the middleware uses — a local ctxKey type would never match.
+// OWASP A09:2021 Security Logging and Monitoring Failures.
 func userIDFromContext(r *http.Request) string {
-	// Reads actor ID injected by auth middleware
-	if v := r.Context().Value("falx_user_id"); v != nil {
-		if s, ok := v.(string); ok {
-			return s
-		}
+	if id := authpkg.UserIDFromContext(r.Context()); id != "" {
+		return id
 	}
 	return "unknown"
 }

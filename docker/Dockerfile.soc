@@ -4,7 +4,14 @@
 # Description: Dockerfile for SOC backend (docker/Dockerfile.soc).
 # =============================================================================
 
+# ── Stage 1: Build ───────────────────────────────────────────────────────────
 FROM golang:1.22-bookworm AS builder
+
+# VERSION — semver string injected at build time (e.g. git describe --tags --always)
+ARG VERSION=dev
+# BUILD_TIME — RFC-3339 UTC timestamp for the binary's version string (e.g. date -u +%Y%m%dT%H%M%SZ)
+ARG BUILD_TIME
+
 WORKDIR /build
 COPY control-plane/ ./control-plane/
 COPY soc-backend/   ./soc-backend/
@@ -13,16 +20,29 @@ COPY ipc/           ./ipc/
 WORKDIR /build/soc-backend
 RUN go mod download
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-    go build -ldflags="-s -w" -o /out/falx-soc ./cmd/...
+    go build \
+      -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" \
+      -o /out/falx-soc ./cmd/...
 
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
+
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
-    ca-certificates curl sqlite3 && rm -rf /var/lib/apt/lists/*
+    ca-certificates curl sqlite3 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder          /out/falx-soc          /usr/local/bin/falx-soc
-COPY soc-backend/dashboard/  /etc/falx/dashboard/
+# Create dedicated non-root system user — security hardening
+RUN groupadd -r -g 1001 falxsoc && useradd -r -u 1001 -g falxsoc -s /sbin/nologin falxsoc
 
-RUN install -d -m 750 /etc/falx /etc/falx/keys /var/lib/falx /var/log/falx /var/run/falx
+# Prepare runtime directories with correct ownership before switching user
+RUN install -d -m 750 -o falxsoc -g falxsoc \
+      /etc/falx /etc/falx/keys /var/lib/falx /var/log/falx /var/run/falx
+
+# Use --chown at COPY time — avoids a separate chmod/chown RUN layer
+COPY --from=builder  --chown=falxsoc:falxsoc /out/falx-soc         /usr/local/bin/falx-soc
+COPY --chown=falxsoc:falxsoc soc-backend/dashboard/                 /etc/falx/dashboard/
+
+USER falxsoc
 
 EXPOSE 8080 50052
 

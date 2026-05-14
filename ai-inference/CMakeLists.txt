@@ -28,9 +28,34 @@ add_compile_options(
 )
 
 # ─── Find Dependencies ────────────────────────────────────────────────────────
-find_package(Threads      REQUIRED)
-find_package(nlohmann_json REQUIRED)
-find_package(spdlog        REQUIRED)
+find_package(Threads REQUIRED)
+
+# nlohmann_json: try system package first, fall back to FetchContent.
+# Ubuntu <22.04 ships nlohmann-json3-dev without CMake config files.
+find_package(nlohmann_json QUIET)
+if(NOT nlohmann_json_FOUND)
+    message(STATUS "nlohmann_json not found via find_package — using FetchContent")
+    include(FetchContent)
+    FetchContent_Declare(
+        nlohmann_json
+        URL      https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+        URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+    )
+    FetchContent_MakeAvailable(nlohmann_json)
+endif()
+
+# spdlog: same pattern — system first, FetchContent fallback.
+find_package(spdlog QUIET)
+if(NOT spdlog_FOUND)
+    message(STATUS "spdlog not found via find_package — using FetchContent")
+    include(FetchContent)
+    FetchContent_Declare(
+        spdlog
+        URL      https://github.com/gabime/spdlog/archive/refs/tags/v1.13.0.tar.gz
+        URL_HASH SHA256=9735f9c969fbe82bf6177e328ec6d1e3cd8f823b7ec61c2843e2e735ad8f9ef8
+    )
+    FetchContent_MakeAvailable(spdlog)
+endif()
 
 # Optional: ONNX Runtime for ML model inference
 find_package(onnxruntime QUIET)

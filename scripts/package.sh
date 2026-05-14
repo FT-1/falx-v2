@@ -39,6 +39,16 @@ echo -e "\n${B}${C}FALX V2 Packager | v$VERSION | FT-1${N}\n"
 # ─── Pre-checks ───────────────────────────────────────────────────────────────
 command -v zip >/dev/null 2>&1 || { echo -e "${R}[ERROR]${N} 'zip' not found. Install: apt install zip"; exit 1; }
 
+# Ensure git working directory is clean before packaging (no uncommitted changes)
+if git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if ! git -C "$ROOT_DIR" diff --quiet || ! git -C "$ROOT_DIR" diff --cached --quiet; then
+        echo -e "${R}[ERROR]${N} Git working directory is not clean. Commit or stash your changes before packaging."
+        echo -e "        Run: git status"
+        exit 1
+    fi
+    echo -e "${G}[OK]${N} Git working directory is clean"
+fi
+
 # ─── Exclusion patterns ───────────────────────────────────────────────────────
 EXCLUDES=(
     # Build artifacts
@@ -52,6 +62,8 @@ EXCLUDES=(
     # Go
     "*/go.sum"
     "*/vendor/*"
+    # Node (should not exist in this project, but guard against accidental inclusion)
+    "*/node_modules/*"
     # BPF objects
     "*.bpf.o"
     # Secrets (NEVER package these)
@@ -66,6 +78,8 @@ EXCLUDES=(
     "*.sqlite3"
     "*.db-shm"
     "*.db-wal"
+    # Runtime sockets (never package live socket files)
+    "*.sock"
     # Logs
     "*.log"
     "*.jsonl"
@@ -74,7 +88,8 @@ EXCLUDES=(
     "*/.vscode/*"
     "*.swp"
     "*~"
-    # Git
+    # Git (entire .git directory — history must never be distributed)
+    "*/.git"
     "*/.git/*"
     "*.gitkeep"
     # OS

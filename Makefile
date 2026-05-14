@@ -77,9 +77,9 @@ check-deps:
 	@command -v $(CMAKE)   >/dev/null 2>&1 || (echo "$(RED)[ERROR] cmake not found. Install CMake >= 3.20.$(RESET)"; exit 1)
 	@command -v $(PYTHON)  >/dev/null 2>&1 || (echo "$(RED)[ERROR] python3 not found.$(RESET)"; exit 1)
 	@command -v bpftool    >/dev/null 2>&1 || (echo "$(YELLOW)[WARN] bpftool not found. Some features may be limited.$(RESET)")
-	@$(RUSTUP) target list --installed | grep -q "bpfel-unknown-none" || \
-		(echo "$(YELLOW)[INFO] Installing bpf Rust target...$(RESET)" && \
-		 $(RUSTUP) target add bpfel-unknown-none)
+	@$(RUSTUP) target list --toolchain nightly --installed | grep -q "bpfel-unknown-none" || \
+		(echo "$(YELLOW)[INFO] Installing bpf Rust target for nightly...$(RESET)" && \
+		 $(RUSTUP) target add bpfel-unknown-none --toolchain nightly)
 	@echo "$(GREEN)[OK] All required dependencies found.$(RESET)"
 
 # ─── Dependency Installation ─────────────────────────────────────────────────
@@ -89,7 +89,7 @@ deps: deps-rust deps-go deps-python
 deps-rust:
 	@echo "$(CYAN)[RUST] Installing Rust dependencies...$(RESET)"
 	@$(RUSTUP) toolchain install nightly --component rust-src
-	@$(RUSTUP) target add bpfel-unknown-none
+	@$(RUSTUP) target add bpfel-unknown-none --toolchain nightly
 	@cargo install bpf-linker 2>/dev/null || true
 
 deps-go:

@@ -28,6 +28,8 @@
 mod types;
 mod maps;
 mod parser;
+mod honeypot;
+mod honeypot_maps;
 
 use aya_ebpf::{
     bindings::xdp_action,
@@ -39,6 +41,7 @@ use aya_ebpf::{
 use maps::*;
 use types::*;
 use parser::parse_packet;
+use honeypot::redirect_to_honeypot;
 
 // ─── XDP Entry Point ──────────────────────────────────────────────────────────
 #[xdp]
@@ -86,7 +89,7 @@ fn process_packet(ctx: &XdpContext) -> Result<u32, u32> {
 
     // ── [6] Blocklist ─────────────────────────────────────────────────────────
     if !pkt.is_ipv6 {
-        if let Some(verdict) = check_blocklist_v4(pkt.src_ip) {
+        if let Some(verdict) = check_blocklist_v4(ctx, pkt.src_ip) {
             return Ok(verdict);
         }
     } else {
@@ -103,7 +106,7 @@ fn process_packet(ctx: &XdpContext) -> Result<u32, u32> {
     }
 
     // ── [8] SYN Flood Heuristic ───────────────────────────────────────────────
-    if pkt.protocol == parser::proto::TCP
+    if pkt.protocol == proto::TCP
         && parser::tcp_flags::is_syn_only(pkt.tcp_flags)
         && cfg.rate_limit_enabled != 0
         && !pkt.is_ipv6
@@ -156,7 +159,7 @@ fn check_failsafe(pkt: &parser::PacketInfo) -> Option<u32> {
 
 // ─── [6a] Blocklist IPv4 ─────────────────────────────────────────────────────
 #[inline(always)]
-fn check_blocklist_v4(src_ip: u32) -> Option<u32> {
+fn check_blocklist_v4(ctx: &XdpContext, src_ip: u32) -> Option<u32> {
     let entry = unsafe { BLOCKLIST_V4.get(&src_ip)? };
 
     // Check TTL expiry
@@ -173,10 +176,8 @@ fn check_blocklist_v4(src_ip: u32) -> Option<u32> {
             Some(xdp_action::XDP_DROP)
         }
         a if a == action::REDIRECT => {
-            // Phase 6: redirect to honeypot XDP_TX path
-            // For now: drop (honeypot not yet wired)
             bump_stat(|s| s.redirected = s.redirected.saturating_add(1));
-            Some(xdp_action::XDP_DROP)
+            Some(redirect_to_honeypot(ctx))
         }
         _ => None,
     }

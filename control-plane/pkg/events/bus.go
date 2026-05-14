@@ -1,7 +1,7 @@
 // =============================================================================
 // Project: FALX V2
 // Lead Architect & Owner: FT-1
-// Description: Internal event bus (control-plane/internal/events/bus.go).
+// Description: Internal event bus (control-plane/pkg/events/bus.go).
 //              Decoupled pub/sub system connecting all FALX V2 subsystems.
 //              Every significant action publishes an event; notification
 //              manager and SOC backend subscribe to relevant topics.
@@ -10,7 +10,7 @@
 //                - Topic-based fan-out (each topic has N subscribers)
 //                - Async, non-blocking delivery
 //                - Subscriber channels are buffered (spikes absorbed)
-//                - Dropped events logged with counter (non-critical)
+//                - Dropped events tracked with atomic counter (no lock needed)
 // =============================================================================
 
 package events
@@ -20,8 +20,25 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// safelySend sends ev to ch without panicking if ch was concurrently closed.
+// Returns false when the channel is closed or full.
+func safelySend(ch chan Event, ev Event) (sent bool) {
+	defer func() {
+		if recover() != nil {
+			sent = false
+		}
+	}()
+	select {
+	case ch <- ev:
+		return true
+	default:
+		return false
+	}
+}
 
 // ─── Topics ───────────────────────────────────────────────────────────────────
 type Topic string
@@ -74,13 +91,18 @@ type Subscriber struct {
 	ID     string
 	Topics []Topic
 	Ch     chan Event
+	// closed is set atomically before the channel is closed, so Publish can
+	// skip this subscriber on the hot path before reaching safelySend.
+	closed atomic.Bool
 }
 
 // ─── Bus ──────────────────────────────────────────────────────────────────────
 type Bus struct {
 	mu          sync.RWMutex
 	subscribers map[Topic][]*Subscriber
-	dropped     int64
+	// dropped counts events lost to full subscriber channels.
+	// Accessed with sync/atomic so concurrent Publish calls don't race.
+	dropped atomic.Int64
 }
 
 func NewBus() *Bus {
@@ -105,9 +127,13 @@ func (b *Bus) Subscribe(id string, bufSize int, topics ...Topic) *Subscriber {
 }
 
 // Unsubscribe removes a subscriber and closes its channel.
+// Marks the subscriber closed BEFORE removing it from the map so that any
+// concurrent Publish that already holds a snapshot of this subscriber will
+// skip it via the closed flag and safelySend's recover — preventing a
+// send-on-closed-channel panic.
 func (b *Bus) Unsubscribe(sub *Subscriber) {
+	sub.closed.Store(true) // Must happen before channel close
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	for _, t := range sub.Topics {
 		subs := b.subscribers[t]
 		for i, s := range subs {
@@ -116,6 +142,11 @@ func (b *Bus) Unsubscribe(sub *Subscriber) {
 				break
 			}
 		}
+	}
+	b.mu.Unlock()
+	// Drain buffered events so readers waiting on Ch.close() don't block.
+	for len(sub.Ch) > 0 {
+		<-sub.Ch
 	}
 	close(sub.Ch)
 }
@@ -135,19 +166,19 @@ func (b *Bus) Publish(ev Event) {
 	b.mu.RUnlock()
 
 	for _, sub := range subs {
-		select {
-		case sub.Ch <- ev:
-		default:
-			b.dropped++
+		if sub.closed.Load() {
+			continue // Skip already-unsubscribed subscribers on the hot path
+		}
+		if !safelySend(sub.Ch, ev) {
+			b.dropped.Add(1)
 		}
 	}
 }
 
 // DropCount returns the number of events dropped due to full subscriber channels.
+// No lock needed — b.dropped is an atomic.Int64.
 func (b *Bus) DropCount() int64 {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.dropped
+	return b.dropped.Load()
 }
 
 // ─── Event Builders ───────────────────────────────────────────────────────────

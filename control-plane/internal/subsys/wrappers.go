@@ -16,7 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/ft-1/falx-v2/control-plane/internal/afxdp"
-	"github.com/ft-1/falx-v2/control-plane/internal/bpfmaps"
+	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
 	"github.com/ft-1/falx-v2/control-plane/internal/failsafe"
 	"github.com/ft-1/falx-v2/control-plane/internal/honeypot"
 	"github.com/ft-1/falx-v2/control-plane/internal/metrics"

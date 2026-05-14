@@ -25,9 +25,9 @@ import (
 
 	"go.uber.org/zap"
 
-	authpkg "github.com/ft-1/falx-v2/control-plane/internal/auth"
-	"github.com/ft-1/falx-v2/control-plane/internal/bpfmaps"
-	"github.com/ft-1/falx-v2/control-plane/internal/events"
+	authpkg "github.com/ft-1/falx-v2/control-plane/pkg/auth"
+	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
+	"github.com/ft-1/falx-v2/control-plane/pkg/events"
 )
 
 // ─── Chaos: Rapid Circuit Breaker Cycling ────────────────────────────────────

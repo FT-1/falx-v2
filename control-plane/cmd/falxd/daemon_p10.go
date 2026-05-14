@@ -18,10 +18,10 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/ft-1/falx-v2/control-plane/internal/bpfmaps"
-	"github.com/ft-1/falx-v2/control-plane/internal/events"
-	"github.com/ft-1/falx-v2/control-plane/internal/notifications"
-	"github.com/ft-1/falx-v2/control-plane/internal/policy"
+	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
+	"github.com/ft-1/falx-v2/control-plane/pkg/events"
+	"github.com/ft-1/falx-v2/control-plane/pkg/notifications"
+	"github.com/ft-1/falx-v2/control-plane/pkg/policy"
 )
 
 // ─── Phase 10 Handles ─────────────────────────────────────────────────────────

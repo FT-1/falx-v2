@@ -24,7 +24,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/ft-1/falx-v2/control-plane/internal/bpfmaps"
+	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
 )
 
 // ─── Detection Result ─────────────────────────────────────────────────────────

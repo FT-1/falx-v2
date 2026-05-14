@@ -11,7 +11,7 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     llvm clang libelf-dev linux-headers-generic pkg-config ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 RUN rustup toolchain install nightly --component rust-src && \
-    rustup target add bpfel-unknown-none && \
+    rustup target add bpfel-unknown-none --toolchain nightly && \
     cargo install bpf-linker
 
 WORKDIR /build
@@ -32,8 +32,9 @@ RUN cd ebpf-user && cargo build --release
 # ── Stage 2: Build Go control plane ─────────────────────────────────────────
 FROM golang:1.22-bookworm AS go-builder
 
-# Pass version from the host (e.g. via: docker build --build-arg VERSION=$(git describe --tags --always))
+# VERSION — semver string injected at build time (e.g. git describe --tags --always)
 ARG VERSION=dev
+# BUILD_TIME — RFC-3339 UTC timestamp for the binary's version string (e.g. date -u +%Y%m%dT%H%M%SZ)
 ARG BUILD_TIME
 
 WORKDIR /build
@@ -51,16 +52,29 @@ RUN CGO_ENABLED=1 \
 
 # ── Stage 3: Runtime ─────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
+
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     libelf1 libbpf1 ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-COPY --from=ebpf-builder /build/ebpf-user/target/release/falx-user /usr/local/bin/falx-user
-COPY --from=go-builder   /out/falxd                                  /usr/local/bin/falxd
-COPY configs/falx.toml   /etc/falx/falx.toml
+# Create dedicated non-root system user (UID/GID 1000) — security hardening
+RUN groupadd -r -g 1000 falx && useradd -r -u 1000 -g falx -s /sbin/nologin falx
 
-RUN install -d -m 750 /etc/falx /etc/falx/keys \
+# Prepare runtime directories with correct ownership before switching user
+RUN install -d -m 750 -o falx -g falx \
+      /etc/falx /etc/falx/keys \
       /var/log/falx /var/lib/falx /var/run/falx
+
+# Use --chown at COPY time — avoids a separate chmod/chown RUN layer
+COPY --from=ebpf-builder --chown=falx:falx /build/ebpf-user/target/release/falx-user /usr/local/bin/falx-user
+COPY --from=go-builder   --chown=falx:falx /out/falxd                                  /usr/local/bin/falxd
+COPY --chown=falx:falx   configs/falx.toml                                              /etc/falx/falx.toml
+
+# BPF/XDP programs still require root capabilities (CAP_BPF, CAP_NET_ADMIN).
+# The USER directive runs the process as non-root by default; operators must
+# grant the required capabilities via --cap-add or setcap rather than running
+# the container as root (principle of least privilege).
+USER falx
 
 ENV FALX_IFACE=eth0 FALX_XDP_MODE=native
 EXPOSE 9090

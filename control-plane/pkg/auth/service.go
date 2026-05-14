@@ -183,7 +183,19 @@ func (s *Service) RefreshTokens(
 		return nil, ErrInvalidCredentials
 	}
 
-	// Rotate refresh token (invalidate old, issue new)
+	// Rotate refresh token: revoke the old session FIRST, then persist the new
+	// one. This prevents a window where both old and new tokens are simultaneously
+	// valid if CreateSession succeeds but RevokeSession is never reached.
+	// SEC-FIX-004: OWASP A07:2021 Identification and Authentication Failures —
+	// refresh token replay window eliminated by atomic revoke-before-reissue.
+	if err := s.store.RevokeSession(sessionID); err != nil {
+		s.log.Warn("Failed to revoke old session during rotation",
+			zap.String("session_id", sessionID),
+			zap.Error(err),
+		)
+		return nil, fmt.Errorf("session rotation failed: %w", err)
+	}
+
 	rawNew, hashedNew, err := s.jwt.GenerateRefreshToken()
 	if err != nil {
 		return nil, err
@@ -191,8 +203,9 @@ func (s *Service) RefreshTokens(
 	session.RefreshToken = hashedNew
 	session.LastActivityAt = time.Now().UTC()
 	session.ExpiresAt = time.Now().Add(s.jwt.RefreshTokenTTL())
-	s.store.CreateSession(session) //nolint:errcheck — rotation
-	s.store.RevokeSession(sessionID)
+	if err := s.store.CreateSession(session); err != nil {
+		return nil, fmt.Errorf("create rotated session: %w", err)
+	}
 
 	// Generate new access token
 	accessToken, expiry, err := s.jwt.GenerateAccessToken(user, session.ID)

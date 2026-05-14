@@ -22,7 +22,7 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/ft-1/falx-v2/control-plane/internal/bpfmaps"
+	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
 )
 
 // ─── Integrated Bridge Handle ─────────────────────────────────────────────────

@@ -25,9 +25,9 @@ import (
 
 	"go.uber.org/zap"
 
-	authpkg "github.com/ft-1/falx-v2/control-plane/internal/auth"
-	"github.com/ft-1/falx-v2/control-plane/internal/events"
-	"github.com/ft-1/falx-v2/control-plane/internal/policy"
+	authpkg "github.com/ft-1/falx-v2/control-plane/pkg/auth"
+	"github.com/ft-1/falx-v2/control-plane/pkg/events"
+	"github.com/ft-1/falx-v2/control-plane/pkg/policy"
 )
 
 // ─── Load Test: API Concurrent Requests ──────────────────────────────────────

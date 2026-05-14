@@ -30,7 +30,6 @@
 
 use aya_ebpf::{
     bindings::xdp_action,
-    helpers::{bpf_csum_diff, bpf_redirect},
     programs::XdpContext,
 };
 use core::mem;
@@ -184,10 +183,12 @@ fn compute_ip_checksum(ctx: &XdpContext, ip_offset: usize, ihl: usize) -> Result
         sum += u16::from_be(word) as u32;
     }
 
-    // Fold 32-bit sum to 16 bits
-    while sum >> 16 != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
+    // Fold 32-bit sum to 16 bits.
+    // BPF verifier requires bounded loops — a 32-bit one's-complement sum of
+    // 30 u16 words can have at most 1 carry bit above bit-16, so 2 iterations
+    // are always sufficient. Unrolling makes this verifier-safe.
+    sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = (sum & 0xFFFF) + (sum >> 16);
 
     Ok(!(sum as u16))
 }
@@ -217,9 +218,10 @@ fn update_l4_checksum(
     csum = csum.wrapping_sub(u16::from_be(old_port) as u32);
     csum = csum.wrapping_add(u16::from_be(new_port) as u32);
 
-    // Fold and complement
-    while csum >> 16 != 0 {
-        csum = (csum & 0xFFFF) + (csum >> 16);
-    }
+    // Fold and complement.
+    // BPF verifier requires bounded loops — unrolled for verifier safety.
+    // At most 2 carries possible from the 6 additions above.
+    csum = (csum & 0xFFFF) + (csum >> 16);
+    csum = (csum & 0xFFFF) + (csum >> 16);
     !(csum as u16)
 }

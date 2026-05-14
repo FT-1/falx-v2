@@ -68,7 +68,7 @@ fi
 
 # BPF target and tools
 log_info "Adding BPF target..."
-rustup target add bpfel-unknown-none 2>/dev/null || true
+rustup target add bpfel-unknown-none --toolchain nightly 2>/dev/null || true
 rustup component add rust-src --toolchain nightly 2>/dev/null || true
 
 log_info "Installing bpf-linker..."
