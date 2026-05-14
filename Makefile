@@ -106,11 +106,19 @@ deps-python:
 	@$(PYTHON) -m pip install -r $(AI_DIR)/requirements.txt --quiet
 
 # ─── eBPF Kernel Program (Rust/Aya) ──────────────────────────────────────────
+# All BPF rustflags live in .cargo/config.toml under [target.bpfel-unknown-none].
+# We explicitly UNSET RUSTFLAGS / CARGO_*_RUSTFLAGS env vars here because:
+#   1) Cargo APPENDS those env vars to [target.<triple>].rustflags rather than
+#      replacing them — duplicate `--disable-memory-builtins` makes bpf-linker
+#      error out with "argument cannot be used multiple times".
+#   2) A host-shell RUSTFLAGS="-C target-cpu=native" leaks into the BPF
+#      cross-compile and produces an `--cpu alderlake` that bpf-linker rejects.
 build-ebpf:
 	@echo "$(CYAN)[eBPF] Building kernel-side XDP program...$(RESET)"
 	@mkdir -p $(BUILD_DIR)/ebpf
 	@cd $(EBPF_KERN_DIR) && \
-		CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS="-C panic=abort" \
+		unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS \
+		      CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS; \
 		$(CARGO) build \
 			--target bpfel-unknown-none \
 			-Z build-std=core \

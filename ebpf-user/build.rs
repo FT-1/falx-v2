@@ -18,12 +18,20 @@ fn main() {
     let kern_dir     = manifest_dir.join("../ebpf-kern");
     let target_dir   = out_dir.join("bpf-target");
 
-    // Build the BPF kernel program in a clean rustflags environment.
-    // RUSTFLAGS / CARGO_ENCODED_RUSTFLAGS from the parent shell (or from the
-    // outer `cargo build`) override per-target settings in .cargo/config.toml,
-    // which is how `-C target-cpu=native` leaks into the BPF compilation and
-    // makes bpf-linker reject "--cpu alderlake". We remove them explicitly
-    // and set a complete, self-contained set of flags for the BPF target.
+    // Build the BPF kernel program. We strip RUSTFLAGS / CARGO_*RUSTFLAGS
+    // env vars inherited from the parent shell (the outer `cargo build` for
+    // ebpf-user sets these for the host target, which would otherwise leak
+    // host-CPU flags into the BPF cross-compile — e.g. `target-cpu=native`
+    // resolving to `alderlake` which bpf-linker rejects).
+    //
+    // We deliberately DO NOT set CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS
+    // here: cargo APPENDS that env var to [target.bpfel-unknown-none].rustflags
+    // in .cargo/config.toml rather than replacing it, so passing the same flag
+    // in both places causes "--disable-memory-builtins" to appear twice in the
+    // linker invocation and bpf-linker errors out with
+    // "the argument '--disable-memory-builtins' cannot be used multiple times".
+    //
+    // All BPF rustflags now live in ONE place: .cargo/config.toml.
     let status = Command::new("cargo")
         .args([
             "+nightly",
@@ -38,12 +46,7 @@ fn main() {
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("CARGO_BUILD_RUSTFLAGS")
-        .env(
-            "CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS",
-            "-C panic=abort \
-             -C target-cpu=generic \
-             -C link-arg=--disable-memory-builtins",
-        )
+        .env_remove("CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS")
         .status()
         .expect("Failed to spawn cargo for BPF kernel build");
 
