@@ -1,0 +1,52 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: systemd service for the SOC backend (scripts/falx-soc.service).
+# =============================================================================
+
+[Unit]
+Description=FALX V2 SOC Backend (HTTP/WS/gRPC)
+Documentation=https://github.com/ft-1/falx-v2
+After=network-online.target falxd.service
+Wants=network-online.target
+BindsTo=falxd.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/lib/falx
+
+ExecStart=/usr/local/bin/falx-soc \
+    --http  0.0.0.0:8080     \
+    --grpc  0.0.0.0:50052    \
+    --db    /var/lib/falx/soc.db \
+    --auth-db  /var/lib/falx/auth.db \
+    --policy-db /var/lib/falx/policy.db \
+    --pin-path /sys/fs/bpf/falx \
+    --jwt-priv /etc/falx/keys/jwt_private.pem \
+    --jwt-pub  /etc/falx/keys/jwt_public.pem
+
+ExecReload=/bin/kill -HUP $MAINPID
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/falx /var/log/falx /var/run/falx /var/lib/falx /sys/fs/bpf/falx
+ProtectHome=yes
+LockPersonality=yes
+RestrictRealtime=yes
+
+LimitNOFILE=65536
+OOMScoreAdjust=-500
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=falx-soc
+
+[Install]
+WantedBy=multi-user.target

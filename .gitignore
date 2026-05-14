@@ -1,0 +1,120 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: .gitignore — excludes build artifacts, secrets, and binaries
+# =============================================================================
+
+# ─── Rust ─────────────────────────────────────────────────────────────────────
+target/
+**/target/
+Cargo.lock
+*.rlib
+*.rmeta
+
+# ─── Go ───────────────────────────────────────────────────────────────────────
+bin/
+dist/
+build/
+*.exe
+*.test
+*.out
+go.sum
+vendor/
+
+# ─── C++ ──────────────────────────────────────────────────────────────────────
+*.o
+*.a
+*.so
+*.dylib
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+*.cmake
+!CMakeLists.txt
+compile_commands.json
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+*.egg-info/
+dist/
+.pytest_cache/
+
+# ─── BPF / Kernel ─────────────────────────────────────────────────────────────
+*.bpf.o
+*.skel.h
+# Never commit pinned maps
+/sys/
+
+# ─── Secrets & Keys (NEVER COMMIT!) ──────────────────────────────────────────
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.der
+/etc/falx/
+.env
+.env.*
+secrets/
+*.secret
+
+# ─── Databases ────────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+*.jsonl
+/var/log/
+
+# ─── IDE / Editor ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+.AppleDouble
+Thumbs.db
+desktop.ini
+
+# ─── Coverage ─────────────────────────────────────────────────────────────────
+coverage.out
+coverage.html
+*.coverage
+.nyc_output/
+
+# ─── Docker ───────────────────────────────────────────────────────────────────
+.dockerignore
+docker-compose.override.yml
+
+# ─── Release artifacts ────────────────────────────────────────────────────────
+/dist/
+/build/
+*.zip
+*.tar.gz
+*.tar.xz
+RELEASE
+
+# ─── Temporary ────────────────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.orig
+.cache/
+tmp/
+
+# ─── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+.Trashes
+ehthumbs.db
+Thumbs.db

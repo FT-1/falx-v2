@@ -1,0 +1,40 @@
+MIT License
+
+Copyright (c) 2024 FT-1 — FALX V2 Project
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+─────────────────────────────────────────────────────────────────────────────
+
+NOTICE: This software includes components with the following licenses:
+
+• Aya (eBPF/Rust):        MIT/Apache-2.0
+• cilium/ebpf (Go):       MIT
+• golang-jwt/jwt:         MIT
+• gorilla/mux:            BSD-3-Clause
+• gorilla/websocket:      BSD-2-Clause
+• mattn/go-sqlite3:       MIT
+• prometheus/client_golang: Apache-2.0
+• go.uber.org/zap:        MIT
+• golang.org/x/crypto:    BSD-3-Clause
+• nlohmann/json (C++):    MIT
+• spdlog (C++):           MIT
+
+The FALX V2 project itself is licensed under MIT.
+Commercial use requires attribution to FT-1 as Lead Architect & Owner.

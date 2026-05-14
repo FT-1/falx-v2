@@ -1,0 +1,33 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Dockerfile for SOC backend (docker/Dockerfile.soc).
+# =============================================================================
+
+FROM golang:1.22-bookworm AS builder
+WORKDIR /build
+COPY control-plane/ ./control-plane/
+COPY soc-backend/   ./soc-backend/
+COPY ipc/           ./ipc/
+
+WORKDIR /build/soc-backend
+RUN go mod download
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w" -o /out/falx-soc ./cmd/...
+
+FROM debian:bookworm-slim
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    ca-certificates curl sqlite3 && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder          /out/falx-soc          /usr/local/bin/falx-soc
+COPY soc-backend/dashboard/  /etc/falx/dashboard/
+
+RUN install -d -m 750 /etc/falx /etc/falx/keys /var/lib/falx /var/log/falx /var/run/falx
+
+EXPOSE 8080 50052
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
+  CMD curl -sf http://localhost:8080/healthz || exit 1
+
+ENTRYPOINT ["/usr/local/bin/falx-soc"]
+CMD ["--http", "0.0.0.0:8080", "--grpc", "0.0.0.0:50052"]

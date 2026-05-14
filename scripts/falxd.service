@@ -1,0 +1,68 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: systemd service unit (scripts/falxd.service).
+#              Install: cp scripts/falxd.service /etc/systemd/system/
+#              Enable:  systemctl daemon-reload && systemctl enable --now falxd
+# =============================================================================
+
+[Unit]
+Description=FALX V2 Hybrid IPS Daemon
+Documentation=https://github.com/ft-1/falx-v2
+After=network-online.target
+Wants=network-online.target
+# Ensure BPF filesystem is mounted
+RequiresMountsFor=/sys/fs/bpf
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/var/lib/falx
+
+ExecStart=/usr/local/bin/falxd \
+    --config /etc/falx/falx.toml \
+    --log-level info
+
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+
+# Allow falxd 30 seconds to shut down gracefully
+TimeoutStopSec=30
+
+# Restart policy: always restart unless manually stopped
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# ── Hardening ─────────────────────────────────────────────────────────────────
+# BPF requires these capabilities
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+
+# Lock down the rest
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/falx /var/log/falx /var/run/falx /var/lib/falx /sys/fs/bpf
+ProtectHome=yes
+ProtectKernelTunables=no  # Required for BPF map operations
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallFilter=@system-service @network-io @basic-io bpf perf_event_open
+
+# Resource limits
+LimitNOFILE=1048576
+LimitMEMLOCK=infinity    # Required for UMEM mmap(MAP_LOCKED)
+OOMScoreAdjust=-900      # Prefer to kill other processes during OOM
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=falxd
+
+[Install]
+WantedBy=multi-user.target

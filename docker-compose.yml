@@ -1,0 +1,193 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Docker Compose deployment (docker-compose.yml).
+#              Deploys the complete FALX V2 stack:
+#                - falxd:      eBPF loader + control plane daemon
+#                - falx-soc:   SOC backend + dashboard
+#                - falx-ai:    AI inference engine
+#                - prometheus: Metrics scraping
+#                - grafana:    Metrics visualisation
+#
+#              IMPORTANT: falxd requires:
+#                - privileged: true (for BPF operations)
+#                - network_mode: host (for XDP attachment to physical NIC)
+#                - /sys/fs/bpf mounted (for map pinning)
+#
+#              Run: docker compose up -d
+#              Dashboard: http://localhost:8080
+#              Prometheus: http://localhost:9090
+#              Grafana:    http://localhost:3000
+# =============================================================================
+
+version: '3.8'
+
+x-falx-labels: &falx-labels
+  com.falx.project: "FALX V2"
+  com.falx.architect: "FT-1"
+
+services:
+
+  # ── falxd: Control Plane Daemon ────────────────────────────────────────────
+  #
+  # IMPORTANT — XDP modes in Docker:
+  #   native:  requires a physical NIC bound to a hardware queue.
+  #            XDP native does NOT work inside a Docker network namespace.
+  #            Use this mode only when deploying on a physical/bare-metal host.
+  #   skb:     works inside Docker containers via generic XDP (lower perf).
+  #            Set FALX_XDP_MODE=skb for containerised testing.
+  #
+  # AF_XDP requirements:
+  #   - ulimits.memlock unlimited: UMEM registration calls mlock(), which
+  #     fails with EPERM when the default memlock limit (64 KB) is in place.
+  #   - CAP_NET_RAW: required by some kernel versions for XDP socket creation.
+  #   - CAP_SYS_ADMIN + CAP_BPF: required for BPF program loading and map ops.
+  falxd:
+    image: falx-v2/falxd:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.falxd
+      args:
+        VERSION: ${FALX_VERSION:-dev}
+        BUILD_TIME: ${FALX_BUILD_TIME:-}
+    container_name: falx-control-plane
+    restart: unless-stopped
+    privileged: true          # Required for BPF operations
+    network_mode: host        # Required for XDP NIC attachment
+    pid: host                 # Required for BPF program attachment
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf                  # BPF filesystem
+      - /lib/modules:/lib/modules:ro              # Kernel modules
+      - /etc/falx:/etc/falx:ro                    # Config
+      - falx-data:/var/lib/falx                   # DB files
+      - falx-logs:/var/log/falx                   # Audit logs
+      - falx-run:/var/run/falx                    # Unix sockets
+      - falx-keys:/etc/falx/keys                  # JWT keys
+    environment:
+      RUST_LOG: info
+      FALX_IFACE: ${FALX_IFACE:-eth0}
+      # Use skb mode for Docker testing; native mode for physical host deployment
+      FALX_XDP_MODE: ${FALX_XDP_MODE:-skb}
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW     # AF_XDP socket creation (required on kernel < 5.19)
+      - SYS_ADMIN
+      - BPF
+    ulimits:
+      memlock:
+        soft: -1    # Unlimited memlock — required for AF_XDP UMEM mlock()
+        hard: -1
+    labels: *falx-labels
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── falx-soc: SOC Backend + Dashboard ──────────────────────────────────────
+  falx-soc:
+    image: falx-v2/soc:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.soc
+    container_name: falx-soc-backend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"    # HTTP + WebSocket + SOC Dashboard
+      - "50052:50052"  # gRPC (SOC service)
+    volumes:
+      - falx-data:/var/lib/falx
+      - falx-logs:/var/log/falx
+      - falx-run:/var/run/falx
+      - falx-keys:/etc/falx/keys:ro
+      - /sys/fs/bpf/falx:/sys/fs/bpf/falx:ro  # Read BPF maps via pin path
+    environment:
+      FALX_SOC_HTTP: "0.0.0.0:8080"
+      FALX_SOC_GRPC: "0.0.0.0:50052"
+      FALX_PIN_PATH: "/sys/fs/bpf/falx"
+    depends_on:
+      falxd:
+        condition: service_healthy
+    labels: *falx-labels
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── falx-ai: AI Inference Engine ───────────────────────────────────────────
+  falx-ai:
+    image: falx-v2/ai:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.ai
+    container_name: falx-ai-engine
+    restart: unless-stopped
+    volumes:
+      - falx-run:/var/run/falx          # Unix socket to falxd
+      - falx-models:/opt/falx/models    # ONNX model files
+    environment:
+      FALX_AI_SOCKET: "/var/run/falx/ai.sock"
+      FALX_AI_BLOCK_THRESHOLD: "0.85"
+      FALX_AI_ALERT_THRESHOLD: "0.50"
+    depends_on:
+      falxd:
+        condition: service_healthy
+    labels: *falx-labels
+    healthcheck:
+      test: ["CMD", "test", "-S", "/var/run/falx/ai.sock"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: falx-prometheus
+    restart: unless-stopped
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    labels: *falx-labels
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: falx-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./docker/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    environment:
+      GF_SECURITY_ADMIN_USER:     ${GRAFANA_USER:-admin}
+      # GRAFANA_PASS must be set explicitly — no insecure default.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASS:?GRAFANA_PASS env var is required}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+      GF_SERVER_ROOT_URL:         "http://localhost:3000"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_SNAPSHOTS_EXTERNAL_ENABLED: "false"
+    depends_on:
+      - prometheus
+    labels: *falx-labels
+
+volumes:
+  falx-data:    { driver: local }
+  falx-logs:    { driver: local }
+  falx-run:     { driver: local }
+  falx-keys:    { driver: local }
+  falx-models:  { driver: local }
+  prometheus-data: { driver: local }
+  grafana-data:    { driver: local }

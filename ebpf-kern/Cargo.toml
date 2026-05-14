@@ -1,0 +1,35 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Cargo manifest for the eBPF kernel-side crate (ebpf-kern).
+#              Targets bpfel-unknown-none (little-endian BPF ISA).
+#              Must remain no_std and no_main with panic=abort.
+# =============================================================================
+
+[package]
+name        = "falx-kern"
+version     = "0.1.0"
+edition     = "2021"
+description = "FALX V2 - eBPF/XDP kernel-side dataplane program"
+authors     = ["FT-1"]
+
+# ─── CRITICAL: BPF programs must be compiled as cdylib or bin with no_std ────
+[[bin]]
+name              = "falx-kern"
+path              = "src/main.rs"
+
+[dependencies]
+aya-ebpf          = { workspace = true }
+aya-log-ebpf      = { workspace = true }
+
+[profile.release]
+opt-level         = 3
+lto               = true
+panic             = "abort"   # Required for BPF target - no unwinding
+codegen-units     = 1
+
+[profile.dev]
+panic             = "abort"   # Also required in dev for BPF
+
+# ─── Build target override for BPF ───────────────────────────────────────────
+# Build with: cargo build --target bpfel-unknown-none -Z build-std=core

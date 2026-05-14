@@ -1,0 +1,29 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Cargo workspace-level config (.cargo/config.toml).
+#              Sets default build targets and linker flags for BPF compilation.
+# =============================================================================
+
+[build]
+# Default target for workspace (host arch for user-space crates)
+# ebpf-kern overrides this via: cargo build --target bpfel-unknown-none
+
+[target.bpfel-unknown-none]
+# bpf-linker is required to produce valid BPF ELF objects from Rust.
+# Install: cargo install bpf-linker
+linker = "bpf-linker"
+rustflags = [
+    "-C", "panic=abort",
+    "-C", "link-arg=--disable-memory-builtins",
+    "-C", "link-arg=--keep-btf",
+]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "target-cpu=native",
+]
+
+# Unstable features required for BPF build-std
+[unstable]
+build-std = ["core"]

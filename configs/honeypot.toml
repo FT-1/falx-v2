@@ -1,0 +1,50 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Honeypot subsystem configuration (configs/honeypot.toml).
+#              Defines the pool of honeypot targets and rotation policy.
+#              Loaded by the control plane at startup and merged with falx.toml.
+# =============================================================================
+
+[honeypot]
+# Enable the silent redirect subsystem
+enabled = true
+
+# Rotate between honeypots every N minutes (0 = no rotation)
+rotation_interval_minutes = 30
+
+# Maximum concurrent redirected IPs
+max_redirected_ips = 10000
+
+# Default TTL for redirect entries (seconds); 0 = permanent until manual removal
+default_redirect_ttl_s = 3600
+
+# ─── Honeypot Targets ─────────────────────────────────────────────────────────
+# Each [[honeypot.target]] block defines one honeypot in the pool.
+# The XDP program will redirect attacker packets to the active target.
+# Targets are activated in order; rotation cycles through the list.
+
+[[honeypot.target]]
+name        = "honeypot-01"
+dst_ip      = "10.0.99.1"        # IP of the honeypot VM/container
+dst_mac     = "52:54:00:11:22:33" # MAC of honeypot NIC (or next-hop router MAC)
+src_mac     = "52:54:00:aa:bb:cc" # Source MAC (real server's MAC)
+dst_port    = 0                   # 0 = preserve original destination port
+active      = true
+
+[[honeypot.target]]
+name        = "honeypot-02"
+dst_ip      = "10.0.99.2"
+dst_mac     = "52:54:00:44:55:66"
+src_mac     = "52:54:00:aa:bb:cc"
+dst_port    = 0
+active      = false
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+[honeypot.logging]
+# Log full payload samples to this directory (forensic capture)
+payload_capture_dir = "/var/log/falx/honeypot/payloads"
+# Maximum payload samples stored per session (memory guard)
+max_samples_per_session = 16
+# Session idle timeout before eviction (seconds)
+session_idle_timeout_s  = 300

@@ -1,0 +1,148 @@
+{
+  "__inputs": [],
+  "__requires": [{"type": "grafana", "id": "grafana", "name": "Grafana", "version": "10.0.0"}],
+  "annotations": {"list": []},
+  "description": "FALX V2 IPS — SOC Monitoring Dashboard | Lead Architect: FT-1",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"steps": [
+            {"color": "green", "value": null},
+            {"color": "yellow", "value": 500000},
+            {"color": "red",   "value": 800000}
+          ]},
+          "unit": "pps"
+        }
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "orientation": "auto", "textMode": "auto", "colorMode": "background"},
+      "title": "Packets / Second",
+      "type": "stat",
+      "targets": [{
+        "expr": "rate(falx_xdp_rx_packets_total[1m])",
+        "legendFormat": "PPS",
+        "refId": "A"
+      }]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"steps": [
+            {"color": "green", "value": null},
+            {"color": "red",   "value": 0.5}
+          ]},
+          "unit": "percentunit"
+        }
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "id": 2,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background"},
+      "title": "Drop Rate",
+      "type": "stat",
+      "targets": [{
+        "expr": "rate(falx_xdp_dropped_total[1m]) / rate(falx_xdp_rx_packets_total[1m])",
+        "legendFormat": "Drop %",
+        "refId": "A"
+      }]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"steps": [
+            {"color": "green", "value": null},
+            {"color": "red",   "value": 1}
+          ]}
+        }
+      },
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "id": 3,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background"},
+      "title": "Circuit Breaker State",
+      "type": "stat",
+      "targets": [{
+        "expr": "falx_failsafe_circuit_open",
+        "legendFormat": "Open=1 / Closed=0",
+        "refId": "A"
+      }]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "unit": "pps"}
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "id": 4,
+      "options": {"tooltip": {"mode": "multi"}},
+      "title": "XDP Traffic — PPS over time",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "rate(falx_xdp_rx_packets_total[1m])",   "legendFormat": "RX Total",     "refId": "A"},
+        {"expr": "rate(falx_xdp_dropped_total[1m])",      "legendFormat": "Dropped",      "refId": "B"},
+        {"expr": "rate(falx_xdp_rate_limited_total[1m])", "legendFormat": "Rate-Limited", "refId": "C"},
+        {"expr": "rate(falx_xdp_passed_total[1m])",       "legendFormat": "Passed",       "refId": "D"}
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "unit": "Bps"}
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "id": 5,
+      "title": "XDP Throughput — Bytes/s",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "rate(falx_xdp_rx_bytes_total[1m])", "legendFormat": "RX Bytes/s", "refId": "A"}
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "id": 6,
+      "title": "Failsafe — Current PPS vs Threshold",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "falx_failsafe_current_pps",     "legendFormat": "Current PPS",   "refId": "A"},
+        {"expr": "falx_failsafe_ema_pps_baseline", "legendFormat": "EMA Baseline",  "refId": "B"}
+      ]
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {
+        "defaults": {"color": {"mode": "palette-classic"}, "unit": "short"}
+      },
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "id": 7,
+      "title": "Policy Engine — Evals & Hits",
+      "type": "timeseries",
+      "targets": [
+        {"expr": "rate(falx_maps_ops_accepted_total[1m])", "legendFormat": "Map Writes Accepted", "refId": "A"},
+        {"expr": "rate(falx_maps_ops_dropped_total[1m])",  "legendFormat": "Map Writes Dropped",  "refId": "B"}
+      ]
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 38,
+  "tags": ["falx-v2", "ips", "security", "FT-1"],
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "FALX V2 — IPS Operations",
+  "uid": "falx-v2-ops",
+  "version": 1
+}

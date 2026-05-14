@@ -1,0 +1,48 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Notifications configuration (configs/notifications.toml).
+#              Configure delivery channels for real-time security alerts.
+# =============================================================================
+
+[notifications]
+enabled = true
+
+# ─── WebSocket (SOC Dashboard — always on) ────────────────────────────────────
+[notifications.websocket]
+enabled = true
+
+# ─── Slack Integration ────────────────────────────────────────────────────────
+[notifications.slack]
+enabled     = false
+webhook_url = "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+# Empty = all topics. Specific topics:
+# "security.ip.blocked", "failsafe.circuit.open", "security.threat.alert"
+topics = [
+    "failsafe.circuit.open",
+    "failsafe.circuit.closed",
+    "security.threat.alert",
+    "admin.user.locked",
+]
+
+# ─── Telegram ─────────────────────────────────────────────────────────────────
+[notifications.telegram]
+enabled   = false
+bot_token = "YOUR_BOT_TOKEN"
+chat_id   = 0
+topics    = [
+    "failsafe.circuit.open",
+    "security.threat.alert",
+]
+
+# ─── Email (SMTP) ─────────────────────────────────────────────────────────────
+[notifications.email]
+enabled   = false
+smtp_addr = "smtp.example.com:587"
+from      = "falx-alerts@example.com"
+to        = ["soc-team@example.com"]
+topics    = [
+    "failsafe.circuit.open",
+    "security.threat.alert",
+    "admin.user.locked",
+]

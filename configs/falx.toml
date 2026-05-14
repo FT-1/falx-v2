@@ -1,0 +1,64 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Primary runtime configuration for FALX V2 IPS.
+#              All tunable parameters for the hybrid IPS pipeline.
+#              Loaded by falxd at startup; changes require reload signal.
+# =============================================================================
+
+[general]
+log_level = "info"          # trace | debug | info | warn | error
+iface     = "eth0"          # Primary interface for XDP attachment
+pin_path  = "/sys/fs/bpf/falx"  # BPF filesystem pin path
+
+# ─── XDP Data Plane ───────────────────────────────────────────────────────────
+[xdp]
+# native  = requires driver support (e1000, mlx5, i40e, etc.) — FASTEST
+# skb     = generic mode, works on any driver, slower (~10% overhead)
+# offload = NIC hardware offload (requires SmartNIC support)
+mode = "native"
+
+# ─── BPF Map Configuration ────────────────────────────────────────────────────
+[maps]
+blocklist_max_entries   = 65536   # IPv4/IPv6 block entries (LRU hash)
+rate_limit_max_entries  = 65536   # Per-source rate limiting buckets
+stats_max_entries       = 256     # Per-CPU stats array size
+# Maximum BPF map write operations per second from control plane
+# Prevents map update flooding from saturating the kernel
+map_write_rate_limit_rps = 10000
+
+# ─── Circuit Breaker / Failsafe Engine ────────────────────────────────────────
+[failsafe]
+# When traffic exceeds these thresholds, the circuit breaker OPENS:
+#   - AI inference is bypassed
+#   - XDP switches to pure hardware-speed DROP mode
+#   - All new connections from unknown sources are dropped
+pps_threshold = 1000000       # 1 Mpps triggers failsafe
+bps_threshold = 10000000000   # 10 Gbps triggers failsafe
+cooldown_secs = 30            # Seconds before re-testing AI path
+auto_drop_mode = true         # Drop unknown traffic when failsafe is OPEN
+
+# ─── AF_XDP / UMEM Zero-Copy Bridge ──────────────────────────────────────────
+[afxdp]
+umem_size      = 4096    # Total frames in shared UMEM pool
+frame_size     = 2048    # Frame size: 2048 or 4096 bytes only
+batch_size     = 64      # Packets processed per RX/TX batch
+queue_id       = 0       # NIC hardware queue index
+num_fill_frames = 2048   # Pre-populated FILL ring frame count
+
+# ─── AI Inference Engine ──────────────────────────────────────────────────────
+[ai]
+grpc_addr       = "127.0.0.1:50051"
+timeout_ms      = 100     # Max wait for AI decision (hard deadline)
+max_retries     = 3       # gRPC retry on transient failure
+block_threshold = 0.85    # Confidence score >= 0.85 triggers block
+
+# ─── SOC Backend ─────────────────────────────────────────────────────────────
+[soc]
+grpc_addr = "0.0.0.0:50052"
+ws_addr   = "0.0.0.0:8080"
+
+# ─── Prometheus Metrics ───────────────────────────────────────────────────────
+[metrics]
+prometheus_addr = "0.0.0.0:9090"
+enabled         = true

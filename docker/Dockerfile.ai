@@ -1,0 +1,57 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Dockerfile for the AI inference engine (docker/Dockerfile.ai).
+#              Multi-stage C++20 build using CMake.
+#              Dependencies: nlohmann-json, spdlog (apt), optional ONNX Runtime.
+#              The engine connects to falxd via Unix socket at runtime.
+# =============================================================================
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM debian:bookworm-slim AS builder
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    pkg-config \
+    ca-certificates \
+    nlohmann-json3-dev \
+    libspdlog-dev \
+    libfmt-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Copy only what CMake needs
+COPY ai-inference/  ./ai-inference/
+COPY ipc/           ./ipc/
+
+RUN cmake \
+      -S ai-inference \
+      -B ai-inference/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_EXE_LINKER_FLAGS="-static-libstdc++ -static-libgcc" \
+    && cmake --build ai-inference/build --parallel "$(nproc)" \
+    && strip ai-inference/build/falx-ai
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    libspdlog1.10 \
+    libfmt9 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/ai-inference/build/falx-ai /usr/local/bin/falx-ai
+
+RUN install -d -m 750 /var/run/falx /opt/falx/models
+
+ENV FALX_AI_SOCKET="/var/run/falx/ai.sock" \
+    FALX_AI_BLOCK_THRESHOLD="0.85" \
+    FALX_AI_ALERT_THRESHOLD="0.50"
+
+HEALTHCHECK --interval=10s --timeout=3s --retries=5 --start-period=15s \
+    CMD test -S /var/run/falx/ai.sock || exit 1
+
+ENTRYPOINT ["/usr/local/bin/falx-ai"]

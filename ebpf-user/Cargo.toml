@@ -1,0 +1,35 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Cargo manifest for the eBPF user-space loader (ebpf-user).
+#              This crate loads, pins, and manages the BPF program lifecycle.
+#              Runs on standard Linux x86_64 with async Tokio runtime.
+# =============================================================================
+
+[package]
+name        = "falx-user"
+version     = "0.1.0"
+edition     = "2021"
+description = "FALX V2 - eBPF user-space loader and map manager"
+authors     = ["FT-1"]
+
+[[bin]]
+name        = "falx-user"
+path        = "src/main.rs"
+
+[dependencies]
+aya             = { workspace = true }
+aya-log         = { workspace = true }
+tokio           = { workspace = true }
+anyhow          = { workspace = true }
+thiserror       = { workspace = true }
+log             = { workspace = true }
+env_logger      = { workspace = true }
+clap            = { workspace = true }
+serde           = { workspace = true }
+toml            = { workspace = true }
+libc            = { workspace = true }
+
+[build-dependencies]
+# aya-build is used to compile the eBPF kernel crate as part of the user build
+aya-build       = "0.1"

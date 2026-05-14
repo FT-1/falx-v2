@@ -1,0 +1,32 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: systemd service for the AI inference engine (scripts/falx-ai.service).
+# =============================================================================
+
+[Unit]
+Description=FALX V2 AI Inference Engine
+After=network-online.target falxd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/lib/falx
+
+ExecStart=/usr/local/bin/falx-ai \
+    --socket /var/run/falx/ai.sock \
+    --model  /var/lib/falx/models/threat_model.onnx \
+    --threshold 0.85
+
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=15
+
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=falx-ai
+
+[Install]
+WantedBy=multi-user.target

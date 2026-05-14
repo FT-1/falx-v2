@@ -1,0 +1,25 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Grafana provisioning (docker/grafana-provisioning.yml).
+# =============================================================================
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    url: http://prometheus:9090
+    access: proxy
+    isDefault: true
+    jsonData:
+      timeInterval: "10s"
+
+dashboards:
+  - name: FALX V2
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
+    disableDeletion: false
+    updateIntervalSeconds: 30

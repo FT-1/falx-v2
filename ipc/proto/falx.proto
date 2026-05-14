@@ -1,0 +1,137 @@
+// =============================================================================
+// Project: FALX V2
+// Lead Architect & Owner: FT-1
+// Description: IPC Protobuf schema (ipc/proto/falx.proto).
+//              Defines the shared message types and service interfaces used
+//              by ALL subsystems: control-plane (Go), AI engine (C++/Python),
+//              and SOC backend (Go). This file is the single source of truth
+//              for inter-process communication contracts.
+// =============================================================================
+
+syntax = "proto3";
+
+package falx.v2;
+
+option go_package     = "github.com/ft-1/falx-v2/control-plane/internal/proto";
+option java_package   = "com.falx.v2";
+
+// ─── Core Types ──────────────────────────────────────────────────────────────
+
+// Represents a network packet's metadata for AI analysis
+// Matches the Rust struct PacketMeta in ebpf-user (populated Phase 4)
+message PacketMeta {
+    uint32 src_ip      = 1;  // Source IPv4 in network byte order
+    uint32 dst_ip      = 2;  // Destination IPv4
+    uint32 src_port    = 3;  // Source port
+    uint32 dst_port    = 4;  // Destination port
+    uint32 protocol    = 5;  // IP protocol (6=TCP, 17=UDP, 1=ICMP)
+    uint64 timestamp   = 6;  // Nanoseconds since epoch
+    uint32 pkt_len     = 7;  // Packet length in bytes
+    uint32 tcp_flags   = 8;  // TCP flags bitfield
+    uint64 flow_id     = 9;  // 5-tuple flow hash (computed by XDP)
+    bytes  payload_sample = 10; // First 64 bytes of payload (optional)
+}
+
+// AI inference request: batch of packet metadata
+message InferenceRequest {
+    repeated PacketMeta packets = 1;
+    uint64 request_id           = 2;
+}
+
+// AI inference response: verdict per packet
+message InferenceResponse {
+    uint64          request_id = 1;
+    repeated Verdict verdicts  = 2;
+}
+
+message Verdict {
+    uint64  flow_id          = 1;
+    Action  action           = 2;  // What to do with this flow
+    float   confidence       = 3;  // 0.0 - 1.0 confidence score
+    string  rule_id          = 4;  // Which rule/model triggered this
+    uint64  block_duration_s = 5;  // How long to block (0 = permanent)
+}
+
+enum Action {
+    ACTION_UNSPECIFIED = 0;
+    ACTION_PASS        = 1;  // Allow traffic
+    ACTION_DROP        = 2;  // Silent drop
+    ACTION_REDIRECT    = 3;  // Redirect to honeypot (Phase 6)
+    ACTION_RATE_LIMIT  = 4;  // Apply rate limiting
+    ACTION_ALERT       = 5;  // Log/alert but don't block
+}
+
+// ─── Map Update RPC ───────────────────────────────────────────────────────────
+
+// Instruction from AI engine to control-plane to update BPF map
+message MapUpdateRequest {
+    MapUpdateType type     = 1;
+    uint32        src_ip   = 2;
+    uint32        dst_ip   = 3;
+    Action        action   = 4;
+    uint64        ttl_s    = 5;  // Entry TTL in seconds (0 = no expiry)
+    string        reason   = 6;
+}
+
+enum MapUpdateType {
+    MAP_UPDATE_BLOCKLIST   = 0;
+    MAP_UPDATE_ALLOWLIST   = 1;
+    MAP_UPDATE_RATE_LIMIT  = 2;
+    MAP_UPDATE_HONEYPOT    = 3;
+}
+
+message MapUpdateResponse {
+    bool   success  = 1;
+    string error    = 2;
+}
+
+// ─── Failsafe Status ─────────────────────────────────────────────────────────
+
+message FailsafeStatus {
+    bool   circuit_open   = 1;  // True = AI bypassed, in pure-drop mode
+    uint64 current_pps    = 2;
+    uint64 current_bps    = 3;
+    uint64 open_since     = 4;  // Unix timestamp when circuit opened
+    string trigger_reason = 5;
+}
+
+// ─── SOC Telemetry ────────────────────────────────────────────────────────────
+
+message TelemetryEvent {
+    uint64  timestamp      = 1;
+    string  event_type     = 2;  // "block", "alert", "failsafe_open", etc.
+    uint32  src_ip         = 3;
+    uint32  dst_ip         = 4;
+    uint32  protocol       = 5;
+    float   threat_score   = 6;
+    string  rule_id        = 7;
+    string  description    = 8;
+}
+
+// ─── gRPC Service Definitions ─────────────────────────────────────────────────
+
+// AI Inference Service (C++ server, Go/CP client)
+service InferenceService {
+    rpc Infer         (InferenceRequest)  returns (InferenceResponse);
+    rpc UpdateMap     (MapUpdateRequest)  returns (MapUpdateResponse);
+    rpc GetStatus     (StatusRequest)     returns (StatusResponse);
+}
+
+// SOC Backend Service (Go server, dashboard client)
+service SOCService {
+    rpc GetFailsafeStatus (StatusRequest)     returns (FailsafeStatus);
+    rpc StreamEvents      (StatusRequest)     returns (stream TelemetryEvent);
+    rpc BlockIP           (MapUpdateRequest)  returns (MapUpdateResponse);
+    rpc UnblockIP         (MapUpdateRequest)  returns (MapUpdateResponse);
+}
+
+message StatusRequest {
+    string requester = 1;
+}
+
+message StatusResponse {
+    string version        = 1;
+    bool   healthy        = 2;
+    uint64 uptime_seconds = 3;
+    string architect      = 4;  // Always "FT-1"
+}

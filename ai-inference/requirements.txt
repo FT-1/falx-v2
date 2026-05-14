@@ -1,0 +1,31 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Python dependencies for the AI inference layer.
+#              Used by the Python-side of the inference pipeline (Phase 9).
+# =============================================================================
+
+# gRPC communication with control plane
+grpcio==1.64.0
+grpcio-tools==1.64.0
+protobuf==5.27.2
+
+# ML inference
+onnxruntime==1.18.0
+numpy==1.26.4
+scipy==1.13.1
+
+# Feature extraction from raw packet data
+scapy==2.5.0
+
+# Async support
+asyncio-rlock==0.0.4
+
+# Configuration
+tomllib-w==1.0.0
+
+# Metrics
+prometheus-client==0.20.0
+
+# Logging
+structlog==24.2.0

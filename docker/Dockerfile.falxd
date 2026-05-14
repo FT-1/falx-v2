@@ -1,0 +1,72 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Dockerfile for falxd (docker/Dockerfile.falxd).
+#              Multi-stage build: Rust (eBPF) + Go (control plane).
+# =============================================================================
+
+# ── Stage 1: Build eBPF kernel program (Rust/Aya) ────────────────────────────
+FROM rust:1.79-slim AS ebpf-builder
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    llvm clang libelf-dev linux-headers-generic pkg-config ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+RUN rustup toolchain install nightly --component rust-src && \
+    rustup target add bpfel-unknown-none && \
+    cargo install bpf-linker
+
+WORKDIR /build
+COPY ebpf-kern/  ./ebpf-kern/
+COPY ebpf-user/  ./ebpf-user/
+COPY Cargo.toml  ./
+COPY .cargo/     ./.cargo/
+
+RUN cd ebpf-kern && \
+    CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS="-C panic=abort" \
+    cargo +nightly build \
+      --target bpfel-unknown-none \
+      -Z build-std=core \
+      --release
+
+RUN cd ebpf-user && cargo build --release
+
+# ── Stage 2: Build Go control plane ─────────────────────────────────────────
+FROM golang:1.22-bookworm AS go-builder
+
+# Pass version from the host (e.g. via: docker build --build-arg VERSION=$(git describe --tags --always))
+ARG VERSION=dev
+ARG BUILD_TIME
+
+WORKDIR /build
+COPY control-plane/ ./control-plane/
+COPY ipc/           ./ipc/
+
+WORKDIR /build/control-plane
+RUN go mod download
+RUN CGO_ENABLED=1 \
+    GOOS=linux GOARCH=amd64 \
+    go build \
+      -ldflags="-s -w -X main.Version=${VERSION} -X main.BuildTime=${BUILD_TIME}" \
+      -o /out/falxd \
+      ./cmd/falxd/...
+
+# ── Stage 3: Runtime ─────────────────────────────────────────────────────────
+FROM debian:bookworm-slim
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    libelf1 libbpf1 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ebpf-builder /build/ebpf-user/target/release/falx-user /usr/local/bin/falx-user
+COPY --from=go-builder   /out/falxd                                  /usr/local/bin/falxd
+COPY configs/falx.toml   /etc/falx/falx.toml
+
+RUN install -d -m 750 /etc/falx /etc/falx/keys \
+      /var/log/falx /var/lib/falx /var/run/falx
+
+ENV FALX_IFACE=eth0 FALX_XDP_MODE=native
+EXPOSE 9090
+
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
+  CMD curl -sf http://localhost:9090/healthz || exit 1
+
+ENTRYPOINT ["/usr/local/bin/falxd"]
+CMD ["--config", "/etc/falx/falx.toml"]
