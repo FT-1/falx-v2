@@ -16,7 +16,8 @@ linker = "bpf-linker"
 rustflags = [
     "-C", "panic=abort",
     "-C", "link-arg=--disable-memory-builtins",
-    "-C", "link-arg=--keep-btf",
+    # --keep-btf was removed in bpf-linker >= 0.9; BTF preservation is now the
+    # default and the flag is rejected as an unknown argument. Do NOT re-add it.
 ]
 
 [target.x86_64-unknown-linux-gnu]
