@@ -506,9 +506,13 @@ trivially fed to a SIEM.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `error: toolchain 'nightly' has no prebuilt artifacts available for target 'bpfel-unknown-none'` | Tier-3 target — `rustup target add` cannot install it | Don't add the target; build uses `-Z build-std=core`. Ensure `rust-src` is installed: `rustup component add rust-src --toolchain nightly` |
-| `error[E0152]: duplicate lang item in crate core: sized` | Stale `target/` from a different toolchain | `cd ebpf-user && cargo clean && cargo build --release` |
-| `Package 'bpftool' has no installation candidate` (Ubuntu 24.04) | Virtual package | `apt install linux-tools-common linux-tools-$(uname -r)` |
+| `Error: error: unexpected argument '--keep-btf' found` (bpf-linker) | `--keep-btf` was removed in `bpf-linker >= 0.9`; BTF is now preserved by default | Pull latest — the flag has been removed from `.cargo/config.toml`. Then `cargo clean && rm -rf target/` to invalidate the stale fingerprint cache |
+| `Error: invalid value 'alderlake' for '--cpu <CPU>'` (bpf-linker) | Host `target-cpu=native` resolved to `alderlake` (Intel 12th gen+) and leaked into the BPF link step | Pull latest — `target-cpu=native` removed from `.cargo/config.toml` and the BPF target now pins `target-cpu=generic` explicitly. Also `cargo clean && rm -rf target/` |
+| `error[E0152]: duplicate lang item in crate core: sized` | `[unstable] build-std = ["core"]` was set GLOBALLY in `.cargo/config.toml`, so cargo built a fresh `core` for the host AS WELL AS the BPF target, which clashed with nightly's pre-built std | Pull latest — the global `build-std` config has been removed; `-Z build-std=core` is now only passed for the BPF target. Then `cargo clean && rm -rf target/` |
+| `Package 'bpftool' has no installation candidate` (Ubuntu 24.04) | Virtual package on Noble | `sudo apt install linux-tools-common linux-tools-$(uname -r)` |
 | `CMake Error … Findnlohmann_json.cmake` | System lib lacks CMake config | The build automatically falls back to FetchContent — make sure CMake ≥ 3.20 |
+| Many warnings: `creating a shared reference to mutable static` and `dead_code` | Rust 2024 compatibility warnings from Aya's BPF map macros + unused future-use constants | **Harmless** — these are warnings only (not errors). The build will still succeed. Aya is tracking the Rust 2024 transition upstream |
+| LLVM messages: `'+fxsr' / '-avx512dq' / 'alderlake' is not a recognized feature/processor` | Same `target-cpu=native` leakage during BPF cross-compile | Same fix as the alderlake row above |
 
 ### Runtime issues
 

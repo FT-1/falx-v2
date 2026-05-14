@@ -16,15 +16,27 @@ linker = "bpf-linker"
 rustflags = [
     "-C", "panic=abort",
     "-C", "link-arg=--disable-memory-builtins",
+    # Force generic CPU for BPF — otherwise the host's target-cpu (e.g.
+    # alderlake on Intel 12th gen+) leaks through and bpf-linker rejects it
+    # with: "invalid value 'alderlake' for '--cpu <CPU>'".
+    "-C", "target-cpu=generic",
     # --keep-btf was removed in bpf-linker >= 0.9; BTF preservation is now the
     # default and the flag is rejected as an unknown argument. Do NOT re-add it.
 ]
 
-[target.x86_64-unknown-linux-gnu]
-rustflags = [
-    "-C", "target-cpu=native",
-]
+# NOTE: We DELIBERATELY do NOT set [target.x86_64-unknown-linux-gnu]
+# rustflags = ["-C", "target-cpu=native"] here. While it would give a small
+# performance boost for the user-space crates, on modern CPUs (alderlake+)
+# it also generates target-features that LLVM ignores during BPF
+# cross-compilation and emits dozens of warnings. Operators who want
+# `target-cpu=native` for the host build should set:
+#     RUSTFLAGS="-C target-cpu=native" cargo build --release
+# on a per-invocation basis, NOT in this config.
 
-# Unstable features required for BPF build-std
-[unstable]
-build-std = ["core"]
+# NOTE: We DELIBERATELY do NOT enable `[unstable] build-std = ["core"]` here.
+# The flag applies GLOBALLY to every target, which makes cargo build a fresh
+# `core` for the host x86_64-unknown-linux-gnu build — which then collides
+# with the nightly toolchain's pre-built std (causing "duplicate lang item
+# in crate core: sized"). The BPF build passes `-Z build-std=core` on the
+# command line (Makefile + ebpf-user/build.rs), so the BPF target gets
+# build-std without polluting host builds.

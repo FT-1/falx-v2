@@ -18,6 +18,12 @@ fn main() {
     let kern_dir     = manifest_dir.join("../ebpf-kern");
     let target_dir   = out_dir.join("bpf-target");
 
+    // Build the BPF kernel program in a clean rustflags environment.
+    // RUSTFLAGS / CARGO_ENCODED_RUSTFLAGS from the parent shell (or from the
+    // outer `cargo build`) override per-target settings in .cargo/config.toml,
+    // which is how `-C target-cpu=native` leaks into the BPF compilation and
+    // makes bpf-linker reject "--cpu alderlake". We remove them explicitly
+    // and set a complete, self-contained set of flags for the BPF target.
     let status = Command::new("cargo")
         .args([
             "+nightly",
@@ -29,7 +35,15 @@ fn main() {
         ])
         .arg(&target_dir)
         .current_dir(&kern_dir)
-        .env("CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS", "-C panic=abort")
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .env(
+            "CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS",
+            "-C panic=abort \
+             -C target-cpu=generic \
+             -C link-arg=--disable-memory-builtins",
+        )
         .status()
         .expect("Failed to spawn cargo for BPF kernel build");
 
