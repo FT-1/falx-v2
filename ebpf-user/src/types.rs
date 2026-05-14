@@ -12,6 +12,25 @@
 
 use serde::{Deserialize, Serialize};
 
+// ─── aya::Pod marker trait ────────────────────────────────────────────────────
+// aya requires any value type stored in Array / PerCpuArray / HashMap maps to
+// implement the `Pod` (Plain Old Data) marker trait. The contract is:
+//   1) The type is `Copy + 'static` (enforced via supertrait bounds in aya).
+//   2) The type has a fixed, well-defined byte layout (#[repr(C)] / no padding
+//      that contains pointers or references).
+//   3) Every bit pattern is a valid instance (no enums with niches, no Box).
+//
+// All five structs below satisfy these constraints: they are `#[repr(C)]`,
+// `Copy + Clone`, contain only primitive integers and fixed-size byte padding,
+// and are designed to be ABI-stable across the kernel↔user boundary.
+//
+// SAFETY: implementing `unsafe trait Pod` is a promise we uphold by construction.
+unsafe impl aya::Pod for BlockEntry    {}
+unsafe impl aya::Pod for RateBucket    {}
+unsafe impl aya::Pod for XdpStats      {}
+unsafe impl aya::Pod for FailsafeState {}
+unsafe impl aya::Pod for FalxMapConfig {}
+
 // ─── Block Entry ──────────────────────────────────────────────────────────────
 /// Mirrors: ebpf-kern/src/types.rs :: BlockEntry
 /// Must match: control-plane/internal/bpfmaps/types.go :: BlockEntry

@@ -15,7 +15,7 @@ mod types;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{info, warn, error, debug};
+use log::{info, warn};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time;

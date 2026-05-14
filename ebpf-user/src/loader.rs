@@ -16,7 +16,12 @@
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
-    maps::{Array, LruHashMap, PerCpuArray, XskMap},
+    // aya 0.13 exposes ONE user-space `HashMap` type that works for both
+    // regular BPF_MAP_TYPE_HASH and BPF_MAP_TYPE_LRU_HASH kernel maps —
+    // the underlying kernel map type was already fixed at program load time
+    // (via the #[map] attribute in ebpf-kern), so no HashMap distinction
+    // is needed on the user side.
+    maps::{Array, HashMap, PerCpuArray},
     programs::{Xdp, XdpFlags},
     Ebpf,
 };
@@ -223,8 +228,8 @@ impl MapManager {
         let pin = self.pin_path.join("blocklist_v4");
         let map_data = MapData::from_pin(&pin)
             .context("Failed to open BLOCKLIST_V4 from pin")?;
-        let mut map: LruHashMap<_, u32, crate::types::BlockEntry> =
-            LruHashMap::try_from(map_data)?;
+        let mut map: HashMap<_, u32, crate::types::BlockEntry> =
+            HashMap::try_from(map_data)?;
 
         map.insert(src_ip, entry, 0)
             .context("Failed to insert blocklist entry")?;
@@ -240,8 +245,8 @@ impl MapManager {
         let pin = self.pin_path.join("blocklist_v4");
         let map_data = MapData::from_pin(&pin)
             .context("Failed to open BLOCKLIST_V4 from pin")?;
-        let mut map: LruHashMap<_, u32, crate::types::BlockEntry> =
-            LruHashMap::try_from(map_data)?;
+        let mut map: HashMap<_, u32, crate::types::BlockEntry> =
+            HashMap::try_from(map_data)?;
 
         map.remove(&src_ip)
             .context("Failed to remove blocklist entry")?;
