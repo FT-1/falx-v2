@@ -71,7 +71,11 @@ EXCLUDES=(
     "*.key"
     "*.crt"
     "*.p12"
-    "*/.env*"
+    # Exact .env files only — NOT .env.example (which is a template safe to ship)
+    "*/.env"
+    "*/.env.local"
+    "*/.env.production"
+    "*/.env.staging"
     # Databases
     "*.db"
     "*.sqlite"

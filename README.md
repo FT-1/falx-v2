@@ -1,846 +1,600 @@
-<div align="center">
+# FALX V2 — Hybrid eBPF/XDP IPS
 
-```
-███████╗ █████╗ ██╗     ██╗  ██╗    ██╗   ██╗██████╗
-██╔════╝██╔══██╗██║     ╚██╗██╔╝    ██║   ██║╚════██╗
-█████╗  ███████║██║      ╚███╔╝     ██║   ██║ █████╔╝
-██╔══╝  ██╔══██║██║      ██╔██╗     ╚██╗ ██╔╝██╔═══╝
-██║     ██║  ██║███████╗██╔╝ ██╗     ╚████╔╝ ███████╗
-╚═╝     ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝      ╚═══╝  ╚══════╝
-```
+> **Project**: FALX V2  Lead Architect & Owner: **FT-1**
+> **Status**: Production-grade  License: Proprietary
+> **Target**: Ubuntu 22.04 LTS / 24.04 LTS  •  Linux kernel ≥ 5.15
 
-**Hybrid XDP/AI Intrusion Prevention System**
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-nightly-orange.svg)](https://www.rust-lang.org)
-[![Go](https://img.shields.io/badge/Go-1.22+-00ADD8.svg)](https://golang.org)
-[![C++](https://img.shields.io/badge/C++-20-blue.svg)](https://isocpp.org)
-[![Kernel](https://img.shields.io/badge/Kernel-≥5.15-green.svg)](https://kernel.org)
-[![XDP](https://img.shields.io/badge/XDP-native%2Fskb-yellow.svg)](https://ebpf.io)
-[![Ubuntu](https://img.shields.io/badge/Ubuntu-22.04%20%7C%2024.04-orange.svg)](https://ubuntu.com)
-
-*Lead Architect & Owner: **FT-1***
-
-</div>
+A high-performance, defense-in-depth **Intrusion Prevention System** that
+combines **kernel-side XDP** (line-rate packet drop) with a **user-space AI
+inference engine** (deep verdicts) and a **multi-user SOC dashboard**
+(RBAC + JWT + audit). Designed to survive volumetric DDoS via an
+**autonomous failsafe circuit breaker** that bypasses the AI path under
+flood, keeping the kernel datapath functional even when the control plane
+is degraded.
 
 ---
 
-## ما هو FALX V2؟
+## Table of Contents
 
-FALX V2 هو نظام منع تسلل **(IPS)** هجين عالي الأداء يعمل في قلب Linux kernel. يجمع بين:
-
-- **XDP سرعة الأجهزة** — قرارات حجب في < 1 µs مباشرة من driver النواة، قبل أن تصل الحزمة لـ TCP/IP stack
-- **ذكاء اصطناعي في User-space** — تحليل عميق (SYN Flood, Port Scan, C2 Beacon, Amplification) بدون تأثير على throughput
-- **منصة أمنية مؤسسية** — Multi-user RBAC، JWT RS256، TOTP 2FA، Audit trail كامل
-- **SOC Dashboard متكامل** — Real-time WebSocket، Arabic RTL، 40+ API endpoint
-
-### لماذا FALX V2 مختلف؟
-
-| الميزة | FALX V2 | Snort 3 | Suricata |
-|---|:---:|:---:|:---:|
-| Throughput | **> 10 Gbps** | ~3 Gbps | ~5 Gbps |
-| Decision latency | **< 1 µs** | ~50 µs | ~30 µs |
-| Memory footprint | **~80 MB** | ~500 MB | ~300 MB |
-| AI Integration | **Native** | Plugin | Plugin |
-| Zero-copy path | **AF_XDP** | ❌ | ❌ |
-| Circuit Breaker | **Autonomous** | Manual | Manual |
-| SOC Dashboard | **Built-in** | ❌ | ❌ |
+1. [Highlights](#highlights)
+2. [Architecture](#architecture)
+3. [Quick Start](#quick-start)
+4. [Installation on Ubuntu](#installation-on-ubuntu)
+5. [Docker Deployment](#docker-deployment)
+6. [Configuration](#configuration)
+7. [REST & WebSocket API](#rest--websocket-api)
+8. [Security Model](#security-model)
+9. [Failsafe / Circuit Breaker](#failsafe--circuit-breaker)
+10. [Observability](#observability)
+11. [Troubleshooting](#troubleshooting)
+12. [Known Limitations](#known-limitations)
+13. [Project Structure](#project-structure)
+14. [Build from Source](#build-from-source)
 
 ---
 
-## المعمارية
+## Highlights
+
+| Property | Value |
+|---|---|
+| **Datapath** | eBPF/XDP — line rate, &lt;1 µs avg packet decision @ 10 Gbps |
+| **AI bypass** | Zero-copy AF_XDP → ONNX inference (C++20) |
+| **Failsafe** | XDP autonomously opens circuit on PPS/BPS threshold breach |
+| **RBAC** | 5 roles · 25+ fine-grained permissions · enforced in middleware |
+| **Authentication** | RS256 JWT (15 min access · 7 day refresh) + TOTP 2FA |
+| **Password hashing** | Argon2id (memory-hard) + constant-time compare |
+| **Audit** | Every block / unblock / login / config change → JSONL log |
+| **Observability** | Prometheus `/metrics` · structured zap logs · live WebSocket |
+| **Map pinning** | All 9 BPF maps pinned to `/sys/fs/bpf/falx/` → control-plane survives daemon restart |
+
+---
+
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Network Interface (NIC)                       │
-│            Intel i40e / Mellanox mlx5 / ixgbe                   │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ Every packet
-                           ▼
-┌──────────────────── XDP Data Plane ─────────────────────────────┐
-│  (Rust/Aya — runs inside Linux kernel at driver level)          │
-│                                                                  │
-│  Packet ──► Parser ──► Blocklist ──► Rate Limiter ──► Failsafe  │
-│              L2/L3/L4    LRU Hash     Token Bucket   Circuit CB  │
-│                             │              │              │       │
-│                         XDP_DROP      XDP_DROP       XDP_DROP    │
-│                                                                  │
-│              XDP_PASS ──────────────────────────────────────►   │
-│              XDP_REDIRECT ──────────────────► Honeypot (XDP_TX) │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ AF_XDP Zero-Copy (UMEM)
-                           ▼
-┌──────────────── Control Plane (Go/falxd) ───────────────────────┐
-│                                                                  │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │ BPF Maps │  │ AF_XDP   │  │ Failsafe │  │   Honeypot    │  │
-│  │ Manager  │  │ Bridge   │  │ Engine   │  │   Manager     │  │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └───────────────┘  │
-│       │              │ PacketMeta  │ Events                      │
-│       └──────────────┴─────────────┘                            │
-│                        │                                         │
-│              ┌──────── Event Bus ────────┐                       │
-│              │  Policy Engine            │                       │
-│              │  Notifications Manager    │                       │
-│              │  Prometheus Collector     │                       │
-│              └───────────────────────────┘                      │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ IPC — FLX2 Protocol (Unix Socket)
-                           ▼
-┌──────────────── AI Inference Engine (C++) ──────────────────────┐
-│  Feature Extraction → Heuristic Scoring → ONNX Model            │
-│  SYN Flood │ Port Scan │ Brute Force │ Amplification │ C2 Beacon │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ HTTP/WS/gRPC
-                           ▼
-┌──────────────── SOC Backend (Go) ───────────────────────────────┐
-│  REST API (40+ routes) │ WebSocket Real-time │ JWT RBAC         │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │              Dashboard (Arabic RTL SPA)                   │  │
-│  │  Block IPs │ Policies │ Users │ Audit │ Failsafe Control  │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+                ┌─────────────────────────────────────────────────────────────┐
+                │                       SOC Dashboard                         │
+                │              (React-style SPA  +  WebSocket)                │
+                └────────────────────────────┬────────────────────────────────┘
+                                             │  HTTPS / Bearer JWT
+                                             ▼
+                  ┌──────────────────────────────────────────────────┐
+                  │              soc-backend (Go)                    │
+                  │  REST API · RBAC · audit · event bus · gRPC       │
+                  └────────────┬──────────────────────┬──────────────┘
+                               │ pinned BPF maps     │ gRPC
+                               ▼                      ▼
+   ┌──────────────────────────────────────┐    ┌─────────────────────────┐
+   │           falxd (Go control plane)   │    │  falx-ai (C++/ONNX)     │
+   │                                       │    │  - feature extraction   │
+   │  - Map manager + hardening            │    │  - deep verdicts        │
+   │  - Failsafe engine (4 detectors)      │◄──►│  - threat scoring       │
+   │  - Honeypot manager + rotation        │ ipc│                          │
+   │  - AF_XDP bridge → AI                 │unix└─────────────────────────┘
+   │  - Policy engine (hot reload)         │
+   │  - Prometheus exporter                │
+   └────────────┬──────────────────────────┘
+                │ pins maps · loads program
+                ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │           Linux kernel — XDP program (Rust / Aya)            │
+   │  parse → stats → failsafe? → blocklist? → rate limit? → PASS │
+   │  AUTONOMOUS circuit breaker (per-packet, lock-free)          │
+   └──────────────────────────────────────────────────────────────┘
+                              ▲
+                              │
+                           NIC (XDP-native or generic SKB)
+```
+
+### Critical safety property
+
+The XDP program in the kernel maintains its **own** copy of the failsafe
+counters (`current_pps`, `current_bps`). If the Go control plane
+crashes, hangs, or is starved of CPU, the kernel program will still trip
+the circuit breaker autonomously when PPS or BPS exceeds the configured
+thresholds — **defense in depth across two layers**.
+
+---
+
+## Quick Start
+
+```bash
+# 1. Clone + build
+git clone https://example.com/falx-v2.git && cd falx-v2
+
+# 2. Install all deps + build (Ubuntu 22.04/24.04, requires sudo)
+sudo bash scripts/setup.sh
+
+# 3. Start the daemon
+sudo systemctl enable --now falxd
+
+# 4. Open the SOC dashboard
+xdg-open http://localhost:8080
+```
+
+Default admin credentials are printed once on first start. Change them
+immediately via the dashboard.
+
+---
+
+## Installation on Ubuntu
+
+Tested on Ubuntu 22.04 LTS (kernel 5.15+) and 24.04 LTS / Noble
+(kernel 6.8+). The setup script is idempotent.
+
+### Step 1 — System packages
+
+```bash
+sudo apt-get update -qq
+sudo apt-get install -y --no-install-recommends \
+    build-essential curl wget git pkg-config \
+    llvm clang libelf-dev libbpf-dev \
+    linux-headers-$(uname -r) linux-tools-common linux-tools-$(uname -r) \
+    sqlite3 libsqlite3-dev \
+    cmake ninja-build \
+    protobuf-compiler libprotobuf-dev libgrpc++-dev protobuf-compiler-grpc \
+    ca-certificates make jq
+```
+
+> On Ubuntu 24.04 **Noble**, `bpftool` is a virtual package — install
+> `linux-tools-$(uname -r)` instead. The setup script handles this
+> automatically.
+
+### Step 2 — Mount BPF filesystem
+
+```bash
+sudo mount -t bpf bpf /sys/fs/bpf
+# Persist across reboots:
+echo "bpf /sys/fs/bpf bpf defaults 0 0" | sudo tee -a /etc/fstab
+```
+
+### Step 3 — Go 1.22
+
+```bash
+curl -L https://go.dev/dl/go1.22.5.linux-amd64.tar.gz -o /tmp/go.tar.gz
+sudo rm -rf /usr/local/go
+sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+echo 'export PATH=$PATH:/usr/local/go/bin' | sudo tee /etc/profile.d/golang.sh
+source /etc/profile.d/golang.sh
+go version          # → go1.22.x
+```
+
+### Step 4 — Rust nightly + BPF tooling
+
+```bash
+# Install rustup with nightly as default
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain nightly
+source "$HOME/.cargo/env"
+
+# Add rust-src so cargo can build core from source (-Z build-std)
+rustup component add rust-src --toolchain nightly
+
+# bpfel-unknown-none is a Tier-3 target — DO NOT use `rustup target add`.
+# The Makefile already uses `-Z build-std=core`, which builds core from
+# source for the BPF target without requiring a prebuilt artifact.
+
+cargo install bpf-linker
+```
+
+### Step 5 — Build everything
+
+```bash
+cd ~/FALX-V2          # or wherever you cloned the repo
+make all              # ≈ 5–10 minutes the first time
+
+# Outputs:
+ls -la dist/          # falxd  falx-soc  falx-ai
+ls -la build/ebpf/    # falx.bpf.o (the XDP program object)
+```
+
+### Step 6 — Install and run as a system service
+
+```bash
+sudo make install                       # → /usr/local/bin + /etc/falx/
+sudo nano /etc/falx/falx.toml           # set [general].iface = "eth0" (or your NIC)
+sudo systemctl enable --now falxd
+sudo journalctl -fu falxd               # tail logs
+```
+
+**Verify** the XDP program is attached:
+
+```bash
+sudo bpftool prog show     # look for "falx_xdp" of type xdp
+sudo bpftool map list      # 9 pinned maps under /sys/fs/bpf/falx
 ```
 
 ---
 
-## هيكل الملفات
+## Docker Deployment
+
+### Prerequisites
+
+- Docker 24+ with Compose v2 plugin
+- Linux host with kernel 5.15+ and BPF filesystem mounted on the host
+- For native XDP: a real NIC (not a Docker bridge). Use `FALX_XDP_MODE=skb`
+  inside a containerised test environment.
+
+### One-command stack
+
+```bash
+export GRAFANA_PASS='a-strong-password'    # mandatory — no insecure default
+export FALX_IFACE=eth0                     # NIC to attach to
+export FALX_XDP_MODE=skb                   # use "native" only on bare metal
+
+docker compose up -d --build
+```
+
+What you get:
+
+| Service | URL | Notes |
+|---|---|---|
+| `falxd` | host network | XDP attached to `$FALX_IFACE` |
+| `falx-soc` | http://localhost:8080 | SOC dashboard + REST API |
+| `falx-ai` | unix socket | AI inference engine |
+| Prometheus | http://localhost:9091 | metrics (port-shifted to avoid conflict) |
+| Grafana | http://localhost:3000 | dashboards (admin / $GRAFANA_PASS) |
+
+### Why falxd needs `privileged: true` and `network_mode: host`
+
+XDP must attach to the **host's** network device queue. A Docker bridge
+network creates a virtual veth pair — XDP cannot attach there at native
+speed. AF_XDP additionally requires:
+
+- `ulimits.memlock: -1`  → UMEM `mlock()` calls fail with EPERM otherwise
+- `CAP_NET_RAW`  → AF_XDP socket creation (older kernels)
+- `CAP_BPF` + `CAP_SYS_ADMIN` + `CAP_NET_ADMIN`  → program load + map ops
+- `/sys/fs/bpf` mounted into the container so pinned maps survive
+
+### Stopping and cleanup
+
+```bash
+docker compose down                # stop containers
+docker compose down -v             # also delete volumes (DB, logs, keys)
+```
+
+---
+
+## Configuration
+
+Primary config: `/etc/falx/falx.toml`. Live-reload via:
+
+```bash
+sudo kill -SIGHUP $(pidof falxd)   # rereads only thresholds (failsafe)
+```
+
+Other config:
+- `/etc/falx/honeypot.toml`  → honeypot pool definitions
+- `/etc/falx/notifications.toml`  → SOC notification channels (Slack / email / webhook)
+
+### Key knobs
+
+```toml
+[general]
+iface     = "eth0"          # NIC to attach XDP
+pin_path  = "/sys/fs/bpf/falx"
+
+[xdp]
+mode      = "native"        # native | skb | offload
+
+[failsafe]
+pps_threshold = 1_000_000   # autonomous trip if exceeded for N consecutive ticks
+bps_threshold = 8_000_000_000
+cooldown_secs = 30          # base cooldown; exponential up to MaxCooldown
+
+[afxdp]
+queue_id   = 0
+umem_size  = 4096           # frames
+frame_size = 2048           # bytes (page-aligned)
+
+[metrics]
+prometheus_addr = "0.0.0.0:9090"
+```
+
+---
+
+## REST & WebSocket API
+
+All endpoints are under `/api/v1/`. Authentication: `Authorization: Bearer <JWT>`.
+
+| Method | Path | Permission | Description |
+|---|---|---|---|
+| POST | `/auth/login` | public | Login → returns access + refresh token |
+| POST | `/auth/refresh` | public | Rotate refresh token (single use) |
+| POST | `/auth/logout` | authed | Revoke current session |
+| GET | `/auth/roles` | authed | List role definitions |
+| GET | `/users` | `user:list` | List users (admin+) |
+| POST | `/users` | `user:create` | Create user (admin+) |
+| PUT | `/users/{id}/lock` | `user:create` | Lock account |
+| PUT | `/users/{id}/unlock` | `user:create` | Unlock account |
+| GET | `/audit` | `audit:read` | Audit trail |
+| GET | `/security/blocklist` | `telemetry:read` | List blocked IPs |
+| POST | `/security/block` | `ip:block_temp` | Block an IP (TTL ≤ 24h for analyst) |
+| DELETE | `/security/block/{ip}` | `ip:block` | Unblock |
+| POST | `/security/redirect` | `ip:block` | Redirect to honeypot |
+| GET | `/security/stats` | `telemetry:read` | XDP stats (aggregated) |
+| GET | `/failsafe` | `failsafe:view` | Current circuit state |
+| POST | `/failsafe/open` | `failsafe:control` | **Emergency**: force circuit OPEN |
+| POST | `/failsafe/close` | `failsafe:control` | Force circuit CLOSED |
+| PUT | `/failsafe/thresholds` | `failsafe:control` | Update PPS/BPS thresholds |
+| GET | `/policy/rules` | `policy:read` | List rules |
+| POST | `/policy/rules` | `policy:create` | Create rule |
+| POST | `/policy/reload` | `policy:create` | Hot-reload from disk |
+| GET | `/system/health` | `system:health` | Subsystem health |
+| GET | `/system/metrics-summary` | `user:list` | XDP + Failsafe summary |
+| WS | `/ws` | authed | Live event stream (alerts, transitions) |
+
+Unauthenticated: `/healthz`, `/readyz`, `/metrics`.
+
+---
+
+## Security Model
+
+### Authentication
+- **RS256 JWT** signed with 4096-bit RSA. Private key kept on disk
+  `0600 falx:falx`; public key may be shared with external services.
+- **Refresh token rotation**: every refresh issues a new opaque token and
+  revokes the prior session in a single atomic operation (SEC-FIX-004 —
+  OWASP A07:2021 mitigated).
+- **TOTP 2FA**: optional per-user, RFC 6238.
+
+### Authorization
+- **RBAC** with 5 roles: `super_admin` > `admin` > `senior_analyst` > `analyst` > `viewer`.
+- Permission checks happen in middleware **before** the handler.
+- `analyst` can only block with `ttl ≤ 24h` (`ip:block_temp` permission).
+
+### Session safety
+- **Inactivity timeout** (25 min) enforced server-side — JWT expiry alone is
+  not sufficient because revocation needs to be immediate.
+- **Login rate limit** 10 attempts/min per IP, with sliding TTL eviction
+  to prevent unbounded memory growth.
+- **Account lockout** after 5 failed attempts.
+
+### Audit
+- Every state-changing operation (block, unblock, login, password change,
+  policy mutation, circuit override) writes a JSONL entry to
+  `/var/log/falx/audit.jsonl` with actor, IP, user agent, success flag,
+  and reason.
+
+### IPC hardening
+- Unix socket at `/var/run/falx/ai.sock` (mode `0600`).
+- **SO_PEERCRED** verification of every connection (UID allow-list).
+- **Symlink-safe** stale-socket cleanup — refuses to bind if the path is
+  a symlink or non-socket file (I2 mitigation).
+- **CIDR deny-list** on map updates from AI peer — refuses to block
+  loopback, link-local, multicast, broadcast (I4 mitigation).
+- **CRC32-framed protocol** with per-connection sequence numbers; bounded
+  message size (1 MiB).
+
+### Container security
+- Non-root users per service: `falx:1000`, `falxsoc:1001`, `falxai:1002`.
+- Read-only root filesystems where possible; minimal capability sets.
+- Multi-stage builds — final image carries only runtime libs.
+
+---
+
+## Failsafe / Circuit Breaker
+
+A **three-state machine** running in the control plane, mirrored by an
+autonomous detector inside the XDP program:
+
+```
+        ┌──────────┐  pps/bps > threshold     ┌────────┐
+        │  CLOSED  │ ──── for N ticks ──────► │  OPEN  │
+        │ (normal) │                          │(drops) │
+        └──────────┘ ◄─── stable for K ticks  └────┬───┘
+              ▲                                    │ cooldown
+              │                                    ▼
+              │                            ┌────────────┐
+              └────────────────────────────│ HALF_OPEN  │
+                  no detector fires        │  (probe)   │
+                                           └────────────┘
+```
+
+Key correctness properties (after audit fixes F1–F14):
+
+| # | Fix | Effect |
+|---|---|---|
+| F1 | Dedicated `overrideThresholdUpdate` kind | Threshold update no longer causes a spurious circuit close |
+| F2 | Non-blocking override channel sends | `ForceOpen`/`ForceClose` return `ErrEngineBusy` instead of blocking when engine is stalled |
+| F3 | `events.Bus` publish on every transition | SOC dashboards receive `CircuitOpen`/`CircuitClosed` events |
+| F6 | Encapsulated `ResetTripCount()` | Engine no longer reaches into private CB fields |
+| F8 | Capped exponential backoff multiplier | `Duration` overflow at trips≈40 eliminated |
+| F9 | `ResetViolation` → set to 0 (not decrement) | Hysteresis now actually trips during sustained moderate floods |
+| F10 | `bpfWriteFailures` atomic counter | Kernel/CP divergence becomes visible to operators |
+| F14 | `defer recover` around tick + override | A detector panic no longer kills the entire failsafe goroutine |
+
+Manual override (SOC operator):
+
+```bash
+curl -X POST -H "Authorization: Bearer $JWT" \
+     -d '{"reason":"investigating-flood"}' \
+     https://localhost:8080/api/v1/failsafe/open
+```
+
+---
+
+## Observability
+
+### Prometheus metrics
+
+```
+falx_xdp_rx_packets_total         counter   total packets received
+falx_xdp_dropped_total            counter   total drops (blocklist + ratelimit + failsafe)
+falx_xdp_passed_total             counter   passed to network stack
+falx_xdp_redirected_total         counter   redirected to honeypot
+falx_failsafe_circuit_open        gauge     1 if open, 0 if closed
+falx_failsafe_trip_count          counter   cumulative trips
+falx_failsafe_bpf_write_failures  counter   kernel/CP divergence indicator (should be 0)
+falx_rate_limit_drops_total       counter   token-bucket drops
+falx_blocklist_v4_size            gauge     current blocked IPs
+falx_afxdp_meta_chan_len          gauge     CP→AI queue fill
+```
+
+### Logs
+
+`falxd` writes structured JSON via zap to stdout. `journalctl -fu falxd`
+or pipe to Loki/ELK for aggregation.
+
+`audit.jsonl` is a strict append-only line-delimited JSON file —
+trivially fed to a SIEM.
+
+### Health endpoints (no auth)
+
+- `GET /healthz` → liveness (returns `{status:"ok", uptime, version}`)
+- `GET /readyz`  → readiness (returns subsystem health; 503 if BPF maps unreachable)
+
+---
+
+## Troubleshooting
+
+### Build issues
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `error: toolchain 'nightly' has no prebuilt artifacts available for target 'bpfel-unknown-none'` | Tier-3 target — `rustup target add` cannot install it | Don't add the target; build uses `-Z build-std=core`. Ensure `rust-src` is installed: `rustup component add rust-src --toolchain nightly` |
+| `error[E0152]: duplicate lang item in crate core: sized` | Stale `target/` from a different toolchain | `cd ebpf-user && cargo clean && cargo build --release` |
+| `Package 'bpftool' has no installation candidate` (Ubuntu 24.04) | Virtual package | `apt install linux-tools-common linux-tools-$(uname -r)` |
+| `CMake Error … Findnlohmann_json.cmake` | System lib lacks CMake config | The build automatically falls back to FetchContent — make sure CMake ≥ 3.20 |
+
+### Runtime issues
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Failed to attach XDP to 'eth0'. Try --mode skb if native is unsupported.` | NIC driver lacks native XDP | Set `[xdp].mode = "skb"` in `falx.toml` |
+| `UMEM registration failed: EPERM` | `memlock` ulimit too low | `systemctl edit falxd` add `LimitMEMLOCK=infinity`, restart |
+| `BPF verifier rejected the program` | Kernel < 5.15 or program too complex | Upgrade kernel: `apt install linux-image-generic-hwe-22.04` |
+| `bpfel-unknown-none has no prebuilt artifacts` | Used `rustup target add` on Tier-3 target | Skip that command — `-Z build-std=core` covers it |
+| `Circuit breaker stays open forever` | `bpfWriteFailures` counter > 0 | Check `/metrics`; investigate divergence; manually close via `POST /failsafe/close` |
+
+### Diagnostic commands
+
+```bash
+# XDP program attached?
+sudo bpftool prog show
+
+# Maps pinned correctly?
+ls -la /sys/fs/bpf/falx/
+
+# Live BPF map stats
+sudo bpftool map dump pinned /sys/fs/bpf/falx/xdp_stats
+
+# Tail the daemon
+sudo journalctl -fu falxd
+
+# Pull a debug dump (SIGUSR1)
+sudo kill -SIGUSR1 $(pidof falxd)
+```
+
+---
+
+## Known Limitations
+
+These items are tracked from the production audit (Phases 1–11). Each has
+a `// AUDIT-FX-NN` marker in the source where applicable.
+
+### High-impact (will be addressed in Phase 12)
+
+- **AF_XDP frame lifecycle (AFX-5)**: under sustained burst, the bridge
+  may push the same frame to FILL ring while a `PacketMeta.UMEMOffset`
+  reference is still live. Mitigation today: AI engine copies
+  `PayloadSample` and does not dereference `UMEMOffset`.
+- **AF_XDP memory barriers (AFX-4)**: producer/consumer ring updates use
+  Go atomics, which provide sequential consistency to other Go code but
+  do not emit hardware `smp_wmb` for the kernel. Works on x86 (strong
+  ordering) but may drop frames on ARM64.
+- **IPC message integrity (IPC-12)**: protocol uses CRC32 (not HMAC) for
+  framing. A peer that passes UID check can still inject crafted frames.
+  Acceptable today because IPC is `0600 falx:falx` — only the falx user
+  can speak it.
+
+### Medium-impact (operational)
+
+- **Threshold persistence (FS-15)**: operator-changed failsafe thresholds
+  are pushed to the BPF map but not persisted to disk. Daemon restart
+  reloads defaults from `falx.toml`. Workaround: edit the toml and SIGHUP.
+- **HALF-OPEN probe (FS-11)**: while the circuit is in HALF-OPEN, the
+  kernel still drops packets, so the "probe" measures zero traffic and
+  always concludes the flood has cleared. Under a continuing flood, the
+  circuit will close briefly (~1 tick) and immediately re-trip; visible
+  as flapping in the `trip_count` metric.
+
+### Low-impact (defensive)
+
+- Bias-free random char mapping in refresh-token encoder relies on
+  `256 % 64 == 0` (mathematically OK, but brittle to alphabet changes).
+- TTL semantics: kernel reads `expire_at` as Unix seconds; if the kernel
+  reads `bpf_ktime_get_ns()/1e9` (monotonic since boot), values differ by
+  uptime. Current code uses absolute timestamps from the control plane,
+  which matches the documented contract.
+
+---
+
+## Project Structure
 
 ```
 falx-v2/
-├── ebpf-kern/          # XDP kernel program (Rust/Aya)
+├── ebpf-kern/                # Rust eBPF kernel program (no_std, Aya)
 │   └── src/
-│       ├── main.rs     # Entry point + XDP pipeline
-│       ├── parser.rs   # Bounds-checked L2/L3/L4 parser
-│       ├── maps.rs     # 6 BPF map declarations
-│       ├── types.rs    # ABI contract (shared with Go/Rust)
-│       └── honeypot.rs # Silent redirect via XDP_TX
-├── ebpf-user/          # BPF loader (Rust/Aya)
-├── control-plane/      # falxd daemon (Go 1.22) — 50+ files
-│   └── internal/
-│       ├── auth/       # JWT RS256 + Argon2id + TOTP + RBAC
-│       ├── bpfmaps/    # Map manager + Rate limiter + Audit
-│       ├── afxdp/      # Zero-copy bridge (UMEM + rings)
-│       ├── failsafe/   # Circuit breaker (4 algorithms)
-│       ├── honeypot/   # Manager + Tracker
-│       ├── ipc/        # FLX2 protocol server (Unix socket)
-│       ├── policy/     # Dynamic rule engine (SQLite)
-│       └── events/     # Event bus (pub/sub)
-├── soc-backend/        # HTTP/WS server + Dashboard (Go)
-│   └── dashboard/      # Arabic RTL SPA (single HTML file)
-├── ai-inference/       # AI engine (C++20 + CMake)
+│       ├── main.rs           # XDP entry → process_packet pipeline
+│       ├── types.rs          # ABI-stable structs (mirrored 3-way)
+│       ├── maps.rs           # BPF map declarations
+│       ├── parser.rs         # Bounds-checked packet parser
+│       └── honeypot.rs       # Silent honeypot redirect
+├── ebpf-user/                # Rust user-space loader (Aya)
 │   └── src/
-│       ├── inference_engine.cpp  # 5 heuristic algorithms
-│       ├── ipc_client.cpp        # FLX2 Unix socket client
-│       └── ipc_protocol.hpp      # Binary frame protocol
-├── configs/            # falx.toml, nginx.conf, seccomp, SQL
-├── docker/             # Dockerfiles + Grafana + Prometheus
-│   ├── Dockerfile.falxd  # Multi-stage: Rust/eBPF + Go
-│   ├── Dockerfile.soc    # Go SOC backend
-│   └── Dockerfile.ai     # C++20 multi-stage build
-├── scripts/            # setup, deploy, audit, package, tests
-└── tests/              # Load + Chaos tests
+│       ├── loader.rs         # Load+pin 9 maps, attach XDP
+│       └── main.rs           # falx-user CLI
+├── control-plane/            # Go daemon (falxd)
+│   ├── cmd/falxd/            # main + daemon orchestrator
+│   ├── pkg/                  # Public API: auth, bpfmaps, events, notifications, policy
+│   └── internal/             # Private: afxdp, failsafe, honeypot, ipc, metrics, subsys
+├── soc-backend/              # Go SOC backend + dashboard
+│   ├── cmd/                  # main
+│   └── internal/             # api handlers, server
+├── ai-inference/             # C++20 AI engine (CMake)
+│   └── src/                  # main, inference_engine, ipc_client
+├── docker/                   # Dockerfile.{falxd,soc,ai} + prometheus.yml
+├── scripts/                  # setup.sh, package.sh, falxd.service
+├── tests/                    # Integration + chaos + load tests
+├── configs/                  # falx.toml, honeypot.toml, notifications.toml
+├── docker-compose.yml        # Full-stack deployment
+├── Makefile                  # Build orchestrator
+├── go.work                   # Multi-module workspace
+└── rust-toolchain.toml       # Pinned to nightly + rust-src
 ```
 
 ---
 
-## التثبيت والبناء
-
-### المتطلبات
-
-| المتطلب | الحد الأدنى | ملاحظة |
-|---|---|---|
-| Ubuntu | 22.04 LTS / 24.04 LTS | OS آخر غير مدعوم |
-| Linux Kernel | ≥ 5.15 | 6.x موصى به |
-| RAM | 8 GB | 16 GB للإنتاج |
-| NIC | تدعم XDP | Intel i40e / Mellanox mlx5 / ixgbe |
-| Go | 1.22+ | لـ control-plane و soc-backend |
-| Rust | nightly | لـ eBPF kernel program |
-| CMake | ≥ 3.20 | لـ AI engine |
-
----
-
-### البناء من المصدر على Ubuntu (خطوة بخطوة)
+## Build from Source
 
 ```bash
-# ══════════════════════════════════════════════════════════════
-# الخطوة 1: حزم النظام
-# ══════════════════════════════════════════════════════════════
-sudo apt-get update && sudo apt-get install -y \
-  build-essential cmake pkg-config git curl wget jq zip \
-  clang llvm libelf-dev linux-headers-$(uname -r) \
-  libbpf-dev bpftool sqlite3 libsqlite3-dev \
-  nlohmann-json3-dev libspdlog-dev libfmt-dev \
-  ca-certificates openssl
-
-# ══════════════════════════════════════════════════════════════
-# الخطوة 2: BPF filesystem (مطلوب لـ BPF map pinning)
-# ══════════════════════════════════════════════════════════════
-sudo mount -t bpf bpffs /sys/fs/bpf 2>/dev/null || true
-grep -q 'bpffs' /etc/fstab || \
-  echo 'bpffs /sys/fs/bpf bpf defaults 0 0' | sudo tee -a /etc/fstab
-
-# تحقق
-mount | grep bpf    # يجب أن يظهر: bpffs on /sys/fs/bpf type bpf
-
-# ══════════════════════════════════════════════════════════════
-# الخطوة 3: Go 1.22
-# ══════════════════════════════════════════════════════════════
-GO_VER=1.22.5
-curl -fsSL "https://go.dev/dl/go${GO_VER}.linux-amd64.tar.gz" \
-  | sudo tar -C /usr/local -xz
-export PATH="$PATH:/usr/local/go/bin"
-echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
-go version    # يجب: go version go1.22.x linux/amd64
-
-# ══════════════════════════════════════════════════════════════
-# الخطوة 4: Rust + eBPF toolchain
-# ══════════════════════════════════════════════════════════════
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
-
-rustup toolchain install nightly --component rust-src
-rustup target add bpfel-unknown-none --toolchain nightly
-cargo install bpf-linker
-
-rustup show    # تحقق أن nightly + bpfel-unknown-none مثبّتَين
-
-# ══════════════════════════════════════════════════════════════
-# الخطوة 5: تثبيت Go dependencies
-# ══════════════════════════════════════════════════════════════
-cd control-plane && go mod tidy && go mod download && cd ..
-cd soc-backend   && go mod tidy && go mod download && cd ..
-
-# ══════════════════════════════════════════════════════════════
-# الخطوة 6: بناء eBPF kernel program (Rust → .bpf.o)
-# ══════════════════════════════════════════════════════════════
-cargo +nightly build \
-  --manifest-path ebpf-kern/Cargo.toml \
-  --target bpfel-unknown-none \
-  -Z build-std=core \
-  --release
-
-# ══════════════════════════════════════════════════════════════
-# الخطوة 7: بناء BPF loader (Rust user-space)
-# ══════════════════════════════════════════════════════════════
-cargo build --manifest-path ebpf-user/Cargo.toml --release
-
-# ══════════════════════════════════════════════════════════════
-# الخطوة 8: بناء Control Plane (Go — falxd daemon)
-# ══════════════════════════════════════════════════════════════
-mkdir -p bin
-cd control-plane
-go build \
-  -ldflags "-s -w -X main.Version=0.1.0 -X main.BuildTime=$(date -u +%Y%m%dT%H%M%SZ)" \
-  -o ../bin/falxd \
-  ./cmd/falxd/
-cd ..
-
-# ══════════════════════════════════════════════════════════════
-# الخطوة 9: بناء AI Inference Engine (C++20 + CMake)
-# ══════════════════════════════════════════════════════════════
-cmake \
-  -S ai-inference \
-  -B ai-inference/build \
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build ai-inference/build --parallel $(nproc)
-cp ai-inference/build/falx-ai bin/
-
-# ══════════════════════════════════════════════════════════════
-# الخطوة 10: بناء SOC Backend (Go)
-# ══════════════════════════════════════════════════════════════
-cd soc-backend
-go build -ldflags "-s -w" -o ../bin/falx-soc ./cmd/
-cd ..
-
-# ══════════════════════════════════════════════════════════════
-# تحقق نهائي
-# ══════════════════════════════════════════════════════════════
-ls -lh bin/
-# يجب أن ترى:
-#   falxd      (Go control plane daemon)
-#   falx-user  (Rust BPF loader)
-#   falx-ai    (C++ inference engine)
-#   falx-soc   (Go SOC backend)
+make help                  # list all targets
+make all                   # full build (10 min cold)
+make dev                   # eBPF + control plane only (fast iteration)
+make test                  # all Go + Rust tests
+make lint                  # clippy + golangci-lint + clang-tidy
+make fmt                   # rustfmt + gofmt
+make clean                 # nuke build artifacts
+sudo make install          # install to /usr/local/bin + /etc/falx
+sudo make uninstall        # remove all installed files
 ```
 
 ---
 
-### الإعداد والتشغيل
+## License & Attribution
 
-```bash
-# ── إعداد المجلدات والإعدادات ─────────────────────────────────
-sudo install -d -m 750 \
-  /etc/falx/keys  /etc/falx/tls \
-  /var/log/falx   /var/lib/falx \
-  /var/run/falx   /opt/falx/models
+Proprietary — © FT-1. All rights reserved.
 
-sudo cp configs/falx.toml          /etc/falx/falx.toml
-sudo cp configs/honeypot.toml      /etc/falx/honeypot.toml
-sudo cp configs/notifications.toml /etc/falx/notifications.toml
-sudo chmod 640 /etc/falx/*.toml
-
-# ── ضبط الواجهة الشبكية ───────────────────────────────────────
-ip link show   # اعرف اسم واجهتك: eth0, ens3, enp3s0 ...
-sudo nano /etc/falx/falx.toml
-# غيّر:   iface = "eth0"    →    iface = "<اسم واجهتك>"
-# للـ VM: mode = "native"   →    mode = "skb"
-
-# ── تهيئة قاعدة بيانات القواعد ───────────────────────────────
-sqlite3 /var/lib/falx/policy.db < configs/default_policy_rules.sql
-
-# ── تثبيت الـ binaries ────────────────────────────────────────
-sudo install -m 755 bin/falxd     /usr/local/bin/falxd
-sudo install -m 755 bin/falx-user /usr/local/bin/falx-user
-sudo install -m 755 bin/falx-ai   /usr/local/bin/falx-ai
-sudo install -m 755 bin/falx-soc  /usr/local/bin/falx-soc
-
-# ── تثبيت systemd services ────────────────────────────────────
-sudo cp scripts/falxd.service    /etc/systemd/system/
-sudo cp scripts/falx-soc.service /etc/systemd/system/
-sudo cp scripts/falx-ai.service  /etc/systemd/system/
-sudo systemctl daemon-reload
-
-# ── تشغيل ─────────────────────────────────────────────────────
-sudo systemctl enable --now falxd
-sudo systemctl enable --now falx-soc
-sudo systemctl enable --now falx-ai   # اختياري — يتطلب ONNX model
-
-# ── مراقبة ────────────────────────────────────────────────────
-sudo journalctl -fu falxd    # Control plane logs
-sudo journalctl -fu falx-soc # SOC backend logs
-
-# ── كلمة مرور admin الافتراضية ────────────────────────────────
-sudo journalctl -u falx-soc | grep "DEFAULT ADMIN"
-# DEFAULT ADMIN CREATED — username=admin temp_password=FLX-XXXXXXXX!
-```
+This project depends on:
+- [Aya](https://aya-rs.dev/) — Rust eBPF library
+- [cilium/ebpf](https://github.com/cilium/ebpf) — Go eBPF library
+- [asavie/xdp](https://github.com/asavie/xdp) — Go AF_XDP socket
+- [gorilla/mux](https://github.com/gorilla/mux) — HTTP routing
+- [golang-jwt/jwt](https://github.com/golang-jwt/jwt) — JWT
+- [ONNX Runtime](https://onnxruntime.ai/) — AI inference
+- [Prometheus](https://prometheus.io/) — metrics
 
 ---
 
-## النشر بـ Docker
-
-> **XDP modes في Docker:**
-> - `native`: يتطلب NIC فيزيائية مربوطة لـ hardware queue — لا يعمل داخل Docker بشكل كامل.
-> - `skb`: يعمل داخل Docker via generic XDP. **استخدمه للاختبار والتطوير.**
-> - للإنتاج على bare-metal: استخدم systemd services (الأسلوب أعلاه).
-
-```bash
-# ── 1. ضبط متغيرات البيئة ─────────────────────────────────────
-export GRAFANA_PASS=$(openssl rand -base64 24)   # إلزامي — لا يوجد default
-export FALX_IFACE=eth0                           # اسم واجهتك الشبكية
-export FALX_XDP_MODE=skb                         # skb للـ Docker، native للـ bare-metal
-export FALX_VERSION=$(git describe --tags --always 2>/dev/null || echo 0.1.0)
-export FALX_BUILD_TIME=$(date -u +%Y%m%dT%H%M%SZ)
-
-# ── 2. بناء وتشغيل الـ stack ──────────────────────────────────
-docker compose up -d --build
-
-# ── 3. مراقبة الـ logs ────────────────────────────────────────
-docker compose logs -f falxd     # Control plane + XDP loader
-docker compose logs -f falx-soc  # SOC backend + API
-docker compose logs -f falx-ai   # AI inference engine
-
-# ── 4. التحقق من الصحة ────────────────────────────────────────
-docker compose ps
-# NAME                  STATUS            PORTS
-# falx-control-plane    healthy           (network_mode: host)
-# falx-soc-backend      healthy           0.0.0.0:8080->8080/tcp
-# falx-ai-engine        healthy           -
-# falx-prometheus       running           0.0.0.0:9091->9090/tcp
-# falx-grafana          running           0.0.0.0:3000->3000/tcp
-
-# ── 5. الخدمات ────────────────────────────────────────────────
-# SOC Dashboard: http://localhost:8080
-# Prometheus:    http://localhost:9091
-# Grafana:       http://localhost:3000   (user: admin / pass: $GRAFANA_PASS)
-
-# ── بناء بنسخة محددة (للـ CI/CD) ─────────────────────────────
-docker compose build \
-  --build-arg VERSION=1.0.0 \
-  --build-arg BUILD_TIME=$(date -u +%Y%m%dT%H%M%SZ) \
-  falxd
-
-# ── إيقاف الـ stack ───────────────────────────────────────────
-docker compose down          # يحفظ الـ volumes
-docker compose down -v       # يحذف الـ volumes (تحذير: حذف البيانات)
-```
-
-### متطلبات Docker الحرجة
-
-| المتطلب | القيمة | السبب |
-|---|---|---|
-| `privileged: true` | required | BPF program loading + XDP attachment |
-| `network_mode: host` | required | XDP يربط مباشرة لـ NIC من الـ host |
-| `ulimits.memlock: -1` | required | AF_XDP UMEM يستدعي `mlock()` — يفشل بـ `EPERM` بدونه |
-| `cap_add: NET_RAW` | required | XDP socket creation (kernel < 5.19) |
-| `cap_add: BPF` | required | BPF syscall access |
-| `cap_add: SYS_ADMIN` | required | BPF program loading |
-| `/sys/fs/bpf:/sys/fs/bpf` | required | BPF map pinning |
-
----
-
-## الاستخدام
-
-### Dashboard
-
-```
-افتح: http://localhost:8080
-
-الدخول الأول:
-  Username: admin
-  Password: (راجع: journalctl -u falx-soc | grep "DEFAULT ADMIN")
-
-يُنصح بتغيير كلمة المرور فوراً عبر: الإعدادات → Change Password
-```
-
-### REST API
-
-```bash
-# ── المصادقة ──────────────────────────────────────────────────
-TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
-    -H "Content-Type: application/json" \
-    -d '{"username":"admin","password":"YOUR_PASSWORD"}' \
-    | jq -r .tokens.access_token)
-
-# ── حظر IP (دائم) ──────────────────────────────────────────────
-curl -s -X POST http://localhost:8080/api/v1/security/block \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"ip":"1.2.3.4","ttl_s":0,"reason":"known_attacker","threat_score":95}'
-
-# ── حظر مؤقت (ساعة) ───────────────────────────────────────────
-curl -s -X POST http://localhost:8080/api/v1/security/block \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"ip":"5.6.7.8","ttl_s":3600,"reason":"port_scan"}'
-
-# ── إلغاء الحظر ───────────────────────────────────────────────
-curl -s -X DELETE http://localhost:8080/api/v1/security/block/1.2.3.4 \
-    -H "Authorization: Bearer $TOKEN"
-
-# ── XDP stats ─────────────────────────────────────────────────
-curl -s http://localhost:8080/api/v1/security/stats \
-    -H "Authorization: Bearer $TOKEN" | jq .xdp
-
-# ── حالة قاطع الدائرة ─────────────────────────────────────────
-curl -s http://localhost:8080/api/v1/failsafe \
-    -H "Authorization: Bearer $TOKEN" | jq
-
-# ── فتح قاطع الدائرة يدوياً ───────────────────────────────────
-curl -s -X POST http://localhost:8080/api/v1/failsafe/open \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{"reason":"manual_test"}'
-
-# ── إضافة قاعدة أمان ───────────────────────────────────────────
-curl -s -X POST http://localhost:8080/api/v1/policy/rules \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d '{
-      "name":       "block-critical-threat",
-      "priority":   9000,
-      "action":     "block",
-      "conditions": [{"type":"threat_score","operator":"gte","value":"90"}],
-      "enabled":    true
-    }'
-
-# ── Health Check ───────────────────────────────────────────────
-curl -s http://localhost:8080/healthz | jq
-# {"status":"ok","uptime":"5m23s","timestamp":"2024-..."}
-```
-
----
-
-## API Reference
-
-جدول شامل لجميع endpoints مرتبة حسب المجموعة الوظيفية.
-
-> Auth Required: جميع الـ endpoints تتطلب `Authorization: Bearer <JWT>` ما عدا `/api/v1/auth/*` و `/healthz`.
-
-### Authentication
-
-| Method | Path | Auth | Role | Description |
-|---|---|:---:|---|---|
-| `POST` | `/api/v1/auth/login` | No | — | تسجيل الدخول — يُعيد access token + refresh token |
-| `POST` | `/api/v1/auth/refresh` | No | — | تجديد الـ access token باستخدام refresh token |
-| `POST` | `/api/v1/auth/logout` | Yes | Any | إلغاء الـ refresh token الحالي |
-| `POST` | `/api/v1/auth/totp/setup` | Yes | Any | إنشاء TOTP secret + QR code |
-| `POST` | `/api/v1/auth/totp/verify` | Yes | Any | التحقق من TOTP وتفعيله |
-| `POST` | `/api/v1/auth/change-password` | Yes | Any | تغيير كلمة المرور |
-
-### Security — Block/Unblock
-
-| Method | Path | Auth | Role | Description |
-|---|---|:---:|---|---|
-| `POST` | `/api/v1/security/block` | Yes | Senior Analyst+ | حظر IP (دائم أو مؤقت بـ `ttl_s`) |
-| `DELETE` | `/api/v1/security/block/:ip` | Yes | Senior Analyst+ | إلغاء حظر IP |
-| `GET` | `/api/v1/security/blocklist` | Yes | Viewer+ | قائمة الـ IPs المحظورة مع metadata |
-| `GET` | `/api/v1/security/stats` | Yes | Viewer+ | XDP counters: passed / dropped / rate-limited |
-
-### Failsafe — Circuit Breaker
-
-| Method | Path | Auth | Role | Description |
-|---|---|:---:|---|---|
-| `GET` | `/api/v1/failsafe` | Yes | Viewer+ | حالة قاطع الدائرة (open/closed/half-open) |
-| `POST` | `/api/v1/failsafe/open` | Yes | Senior Analyst+ | فتح القاطع يدوياً (bypass mode) |
-| `POST` | `/api/v1/failsafe/close` | Yes | Admin+ | إعادة تشغيل الحماية |
-| `GET` | `/api/v1/failsafe/events` | Yes | Viewer+ | سجل أحداث قاطع الدائرة |
-
-### Policy Rules
-
-| Method | Path | Auth | Role | Description |
-|---|---|:---:|---|---|
-| `GET` | `/api/v1/policy/rules` | Yes | Viewer+ | عرض كل القواعد |
-| `POST` | `/api/v1/policy/rules` | Yes | Senior Analyst+ | إضافة قاعدة جديدة |
-| `PUT` | `/api/v1/policy/rules/:id` | Yes | Senior Analyst+ | تعديل قاعدة |
-| `DELETE` | `/api/v1/policy/rules/:id` | Yes | Admin+ | حذف قاعدة |
-| `POST` | `/api/v1/policy/rules/:id/toggle` | Yes | Senior Analyst+ | تفعيل / تعطيل قاعدة |
-
-### User Management
-
-| Method | Path | Auth | Role | Description |
-|---|---|:---:|---|---|
-| `GET` | `/api/v1/users` | Yes | Admin+ | قائمة المستخدمين |
-| `POST` | `/api/v1/users` | Yes | Admin+ | إنشاء مستخدم جديد |
-| `PUT` | `/api/v1/users/:id` | Yes | Admin+ | تعديل بيانات مستخدم |
-| `DELETE` | `/api/v1/users/:id` | Yes | Super Admin | حذف مستخدم |
-| `POST` | `/api/v1/users/:id/role` | Yes | Super Admin | تعيين دور |
-| `POST` | `/api/v1/users/:id/unlock` | Yes | Admin+ | فك قفل الحساب بعد lockout |
-
-### Audit & Events
-
-| Method | Path | Auth | Role | Description |
-|---|---|:---:|---|---|
-| `GET` | `/api/v1/audit` | Yes | Senior Analyst+ | سجل العمليات الحساسة (paginated) |
-| `GET` | `/api/v1/events/stream` | Yes | Viewer+ | WebSocket stream للأحداث الحية |
-
-### System
-
-| Method | Path | Auth | Role | Description |
-|---|---|:---:|---|---|
-| `GET` | `/healthz` | No | — | فحص صحة الخدمة (يُستخدم من Docker HEALTHCHECK) |
-| `GET` | `/metrics` | No | — | Prometheus metrics endpoint |
-
----
-
-## Prometheus Metrics
-
-يُصدر falxd على المنفذ `:9090/metrics` مجموعة من الـ metrics القياسية.
-
-### Counters
-
-| Metric | Labels | Description |
-|---|---|---|
-| `falx_packets_total` | `verdict={passed,dropped,rate_limited,redirected}` | عدد الحزم المُعالجة منذ بدء التشغيل |
-| `falx_bpf_map_writes_total` | `map={blocklist,rate_limiter,failsafe_state,...}` | عدد عمليات الكتابة على كل BPF map |
-| `falx_policy_evaluations_total` | `result={match,no_match}` | عدد مرات تقييم قواعد الـ policy engine |
-| `falx_auth_attempts_total` | `result={success,failure,locked}` | محاولات المصادقة |
-| `falx_ipc_messages_total` | `direction={recv,sent}`, `type` | رسائل بروتوكول FLX2 على الـ Unix socket |
-
-### Gauges
-
-| Metric | Labels | Description |
-|---|---|---|
-| `falx_circuit_breaker_state` | — | حالة قاطع الدائرة: `0`=closed (طبيعي), `1`=open (bypass), `2`=half-open |
-| `falx_blocklist_size` | — | عدد الـ IPs المحظورة حالياً في BPF map |
-| `falx_active_connections` | `source={soc,ai}` | الاتصالات النشطة على Unix socket |
-
-### Histograms
-
-| Metric | Labels | Description |
-|---|---|---|
-| `falx_bpf_map_write_duration_seconds` | `map` | توزيع زمن استجابة عمليات الكتابة على الـ maps |
-| `falx_policy_evaluation_duration_seconds` | — | توزيع زمن تقييم القواعد |
-
-```bash
-# استعراض كل الـ metrics
-curl -s http://localhost:9090/metrics | grep '^falx_'
-
-# مثال: مجموع الحزم المحظورة
-curl -s http://localhost:9090/metrics | grep 'falx_packets_total{verdict="dropped"}'
-```
-
----
-
-## الأدوار والصلاحيات (RBAC)
-
-| الدور | Block IP | Block Temp | Policies | Users | Failsafe | Audit |
-|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Viewer** | ❌ | ❌ | عرض | ❌ | عرض | ❌ |
-| **Analyst** | ❌ | ✅ (24h) | عرض | ❌ | عرض | ❌ |
-| **Senior Analyst** | ✅ | ✅ | إدارة | ❌ | تحكم | ✅ |
-| **Admin** | ✅ | ✅ | إدارة | ✅ | تحكم | ✅ |
-| **Super Admin** | ✅ | ✅ | إدارة | ✅ + تعيين أدوار | كامل | ✅ |
-
----
-
-## الاختبار
-
-```bash
-# اختبارات الوحدة (Go)
-bash scripts/run_tests.sh
-
-# مع race detector (إلزامي قبل الإنتاج)
-bash scripts/run_tests.sh --race
-
-# Benchmarks
-bash scripts/run_tests.sh --bench
-
-# فحص الأمان الشامل
-sudo bash scripts/security_audit.sh
-
-# ABI verification: تحقق أن Rust structs ↔ Go structs متطابقة حجماً
-bash scripts/verify_abi.sh
-
-# Load test (يتطلب falxd يعمل)
-go test ./tests/ -run TestLoad -v -timeout 60s
-
-# Chaos test (يتطلب صلاحيات root)
-sudo go test ./tests/ -run TestChaos -v -timeout 120s
-```
-
----
-
-## الأداء
-
-```
-XDP Throughput:      > 10 Gbps  (native mode, Intel i40e)
-Decision Latency:    < 1 µs     (XDP_DROP path)
-Blocklist Lookup:    O(1)       (BPF LRU Hash Map)
-Policy Evaluation:   > 1,000,000 rules/sec (50 rules, no alloc)
-Event Bus:           > 500,000  pub/sec
-JWT Validation:      > 10,000   req/sec (RS256 cached)
-AI Inference:        ~200 µs    (heuristic, no ONNX model)
-Memory:              ~80 MB     (all subsystems running)
-```
-
----
-
-## الأمان
-
-| الآلية | التفاصيل |
-|---|---|
-| **Argon2id** | كلمات المرور — 64 MiB، 3 iterations، salt عشوائي |
-| **JWT RS256** | 4096-bit RSA asymmetric signing — الـ private key يبقى في auth service فقط |
-| **TOTP 2FA** | RFC 6238 مع replay prevention (30s window) |
-| **Refresh token rotation** | كل استخدام يُبطل التوكن القديم ويُصدر جديداً |
-| **Account lockout** | بعد 5 محاولات فاشلة — يتطلب admin لإلغاء القفل |
-| **SO_PEERCRED** | التحقق من هوية AI engine قبل قبول أوامر الحجب |
-| **Seccomp profile** | يقيّد syscalls لـ falxd للحد الأدنى المطلوب |
-| **Rate limiting** | حماية BPF maps من الـ flood (10,000 ops/sec per type) |
-| **Audit trail** | كل عملية حساسة مسجّلة في `/var/log/falx/audit.jsonl` |
-| **RBAC** | 5 أدوار، 25+ صلاحية، تحقق في كل API request |
-
-راجع [SECURITY.md](SECURITY.md) للتفاصيل الكاملة ونموذج التهديد.
-
----
-
-## استكشاف الأخطاء
-
-### falxd لا يبدأ
-
-```bash
-sudo journalctl -u falxd -n 50 --no-pager
-
-# الأخطاء الشائعة وحلولها:
-```
-
-| الخطأ | السبب | الحل |
-|---|---|---|
-| `Failed to load BPF object` | kernel < 5.15 أو CAP_BPF مفقود | `uname -r` — تحقق ≥ 5.15 |
-| `interface not found` | اسم الواجهة في falx.toml خاطئ | `ip link show` ثم صحّح `iface` |
-| `BPF filesystem not mounted` | `/sys/fs/bpf` غير موجود | `sudo mount -t bpf bpffs /sys/fs/bpf` |
-| `cannot open pinned map` | ebpf-user لم يُشغَّل بعد | تأكد من تسلسل: `falx-user` قبل `falxd` |
-| `permission denied` on UMEM | `RLIMIT_MEMLOCK` محدود | `ulimit -l unlimited` أو أضف systemd `LimitMEMLOCK=infinity` |
-
-### XDP native mode فاشل
-
-```bash
-# تحقق من دعم الـ driver
-ethtool -i eth0 | grep driver
-# i40e, mlx5_core, ixgbe, bnxt_en  → native ✅
-# virtio_net, e1000, vmxnet3        → يحتاج skb mode ⚠️
-
-# التبديل لـ skb mode
-sudo sed -i 's/mode = "native"/mode = "skb"/' /etc/falx/falx.toml
-sudo systemctl restart falxd
-```
-
-### AF_XDP UMEM فاشل في Docker
-
-```bash
-# العرض في الـ logs:
-# "mlock: operation not permitted" أو "EPERM"
-
-# الحل: تأكد من وجود هذا في docker-compose.yml
-# ulimits:
-#   memlock:
-#     soft: -1
-#     hard: -1
-
-# أو شغّل يدوياً:
-docker run --ulimit memlock=-1:-1 ...
-```
-
-### أخطاء XDP mode شائعة
-
-| الخطأ | السبب | الحل |
-|---|---|---|
-| `XDP_FLAGS_DRV_MODE: invalid argument` | الـ driver لا يدعم native XDP | غيّر إلى `mode = "skb"` في falx.toml |
-| `bind: cannot assign requested address` | رقم queue channel غير متاح | تحقق: `ethtool -l eth0` وعدّل `queue_id` |
-| `failed to create UMEM` | حجم UMEM أكبر من `RLIMIT_MEMLOCK` | `ulimit -l unlimited` أو `LimitMEMLOCK=infinity` في systemd unit |
-| `xdp_attach: device busy` | XDP program آخر مُركَّب على الواجهة | `sudo ip link set eth0 xdpdrv off` ثم أعد التشغيل |
-| `AF_XDP socket: operation not supported` | kernel < 4.18 | ترقية الـ kernel، الحد الأدنى 5.15 |
-
-### أخطاء BPF loading
-
-| الخطأ | السبب | الحل |
-|---|---|---|
-| `libbpf: failed to load object` | kernel لا يدعم BTF | `CONFIG_DEBUG_INFO_BTF=y` مطلوب في kernel config |
-| `permission denied (EPERM) loading BPF` | غياب `CAP_BPF` | أضف capability: `sudo setcap cap_bpf+ep /usr/local/bin/falxd` |
-| `verifier log: invalid mem access` | حجم BPF stack تجاوز 512 bytes | تحقق من تغييرات أخيرة في `ebpf-kern/src/` |
-| `map_create: too many open files` | تجاوز `RLIMIT_NOFILE` | أضف `LimitNOFILE=65536` في systemd unit |
-| `BTF not found` | ملف `.bpf.o` لا يحتوي BTF section | أعد البناء بـ `RUSTFLAGS="-C debuginfo=2"` |
-
-### SOC Backend لا يتصل بـ falxd
-
-```bash
-# تحقق من Unix socket
-ls -la /var/run/falx/
-# يجب أن يظهر: ipc.sock, ai.sock
-
-# تحقق من الصلاحيات
-sudo journalctl -u falx-soc | grep "connection refused"
-# إذا ظهر → تأكد أن falxd يعمل أولاً
-```
-
-### مشكلة صلاحيات BPF
-
-```bash
-# إضافة capabilities بدون تشغيل كـ root
-sudo setcap cap_bpf,cap_net_admin,cap_net_raw,cap_sys_admin+ep /usr/local/bin/falxd
-
-# تحقق
-getcap /usr/local/bin/falxd
-```
-
-### التحقق من BPF maps مباشرة
-
-```bash
-# عرض الـ maps المحمّلة
-sudo bpftool map show | grep falx
-
-# البحث عن IP في blocklist (1.2.3.4)
-sudo bpftool map lookup \
-    pinned /sys/fs/bpf/falx/blocklist_v4 \
-    key hex $(printf '%02x %02x %02x %02x' 1 2 3 4)
-
-# عرض كل الـ IPs المحظورة
-sudo bpftool map dump pinned /sys/fs/bpf/falx/blocklist_v4
-
-# حذف IP من blocklist يدوياً (تجاوز الـ API)
-sudo bpftool map delete \
-    pinned /sys/fs/bpf/falx/blocklist_v4 \
-    key hex $(printf '%02x %02x %02x %02x' 1 2 3 4)
-
-# عرض Rate Limiter state لـ IP
-sudo bpftool map lookup \
-    pinned /sys/fs/bpf/falx/rate_limiter \
-    key hex $(printf '%02x %02x %02x %02x' 1 2 3 4)
-
-# عرض Failsafe state (0=closed, 1=open, 2=half-open)
-sudo bpftool map dump pinned /sys/fs/bpf/falx/failsafe_state
-
-# عرض XDP packet counters
-sudo bpftool map dump pinned /sys/fs/bpf/falx/xdp_stats
-
-# مراقبة XDP stats بشكل مستمر (كل ثانية)
-watch -n1 'sudo bpftool map dump pinned /sys/fs/bpf/falx/xdp_stats'
-
-# التحقق من BPF program المُحمَّل على الواجهة
-sudo bpftool net show dev eth0
-```
-
----
-
-## النشر على Production
-
-```bash
-# ── النشر التلقائي (zero-downtime rolling update) ──────────────
-sudo bash scripts/deploy.sh
-
-# ── استرجاع إصدار سابق عند المشكلة ───────────────────────────
-sudo bash scripts/deploy.sh --rollback
-
-# ── إعداد TLS (Let's Encrypt) ─────────────────────────────────
-sudo certbot certonly --standalone -d soc.yourdomain.com
-sudo cp /etc/letsencrypt/live/soc.yourdomain.com/fullchain.pem /etc/falx/tls/server.crt
-sudo cp /etc/letsencrypt/live/soc.yourdomain.com/privkey.pem   /etc/falx/tls/server.key
-sudo chmod 600 /etc/falx/tls/server.key
-
-# ── Nginx Reverse Proxy ────────────────────────────────────────
-sudo cp configs/nginx.conf /etc/nginx/sites-available/falx
-sudo sed -i 's/soc.falx.local/soc.yourdomain.com/' /etc/nginx/sites-available/falx
-sudo ln -sf /etc/nginx/sites-available/falx /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-### ONNX Model للـ AI engine (اختياري)
-
-```bash
-# ضع الـ model في:
-sudo mkdir -p /opt/falx/models
-sudo cp your_model.onnx /opt/falx/models/threat_classifier.onnx
-
-# أو في Docker:
-# falx-models volume يُماب على /opt/falx/models
-docker cp your_model.onnx falx-ai-engine:/opt/falx/models/
-docker restart falx-ai-engine
-```
-
----
-
-## إنشاء حزمة للتوزيع
-
-```bash
-# حزمة قياسية (بدون docs)
-bash scripts/package.sh --version=1.0.0
-
-# حزمة شاملة مع الوثائق
-bash scripts/package.sh --version=1.0.0 --with-docs
-
-# حزمة في مجلد مخصص
-bash scripts/package.sh --version=1.0.0 --output=/tmp
-
-# الناتج:
-# FALX-V2-1.0.0-20240101-FT1.zip
-# FALX-V2-1.0.0-20240101-MANIFEST.txt  (SHA256 + MD5 + file list)
-```
-
----
-
-## الوثائق
-
-| الملف | الوصف |
-|---|---|
-| [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md) | دليل تشغيل Ubuntu المفصّل خطوة بخطوة |
-| [SECURITY.md](SECURITY.md) | سياسة الأمان ونموذج التهديد الكامل |
-| [CHANGELOG.md](CHANGELOG.md) | تاريخ الإصدارات وأرقام الأداء |
-| [FINAL_REVIEW.md](FINAL_REVIEW.md) | مراجعة شاملة وسجل كل الإصلاحات |
-
----
-
-## الترخيص
-
-[MIT License](LICENSE) — Copyright (c) 2024 FT-1
-
----
-
-<div align="center">
-
-**FALX V2** — *"الكود الغبي السريع في النواة + الذكاء خارج النواة = الأمان الحقيقي"*
-
-**Lead Architect & Owner: FT-1**
-
-</div>
+**FALX V2 — Architect & Owner: FT-1**

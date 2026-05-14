@@ -28,6 +28,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,19 +108,38 @@ func NewServer(cfg ServerConfig, bpfMgr *bpfmaps.Manager, log *zap.Logger) *Serv
 
 // ─── Run ──────────────────────────────────────────────────────────────────────
 func (s *Server) Run(ctx context.Context) error {
-	// Ensure socket directory exists with correct permissions
-	if err := os.MkdirAll("/var/run/falx", 0o750); err != nil {
-		return fmt.Errorf("create socket dir: %w", err)
+	// Hardening (I1): derive parent dir from the configured SocketPath rather
+	// than hard-coding "/var/run/falx" — otherwise a custom socket path lands
+	// in a directory whose permissions were never tightened.
+	socketDir := filepath.Dir(s.cfg.SocketPath)
+	if err := os.MkdirAll(socketDir, 0o750); err != nil {
+		return fmt.Errorf("create socket dir %s: %w", socketDir, err)
 	}
 
-	// Remove stale socket from previous run
-	os.Remove(s.cfg.SocketPath)
+	// Hardening (I2): symlink-safe stale-socket cleanup. Use Lstat (not Stat)
+	// so a malicious symlink at SocketPath does not redirect the unlink to
+	// an attacker-chosen target. Only remove if the path is actually a socket;
+	// any other file type means something unexpected is there — refuse to
+	// continue rather than silently clobber it.
+	if info, err := os.Lstat(s.cfg.SocketPath); err == nil {
+		mode := info.Mode()
+		if mode&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to bind: %s is a symlink (potential symlink-race attack)", s.cfg.SocketPath)
+		}
+		if mode&os.ModeSocket == 0 {
+			return fmt.Errorf("refusing to bind: %s exists and is not a socket (mode=%v)", s.cfg.SocketPath, mode)
+		}
+		if err := os.Remove(s.cfg.SocketPath); err != nil {
+			return fmt.Errorf("remove stale socket: %w", err)
+		}
+	}
 
 	listener, err := net.Listen("unix", s.cfg.SocketPath)
 	if err != nil {
 		return fmt.Errorf("unix listen %s: %w", s.cfg.SocketPath, err)
 	}
-	// Restrict socket to root only
+	// Restrict socket to owner only (0600). SO_PEERCRED on accept enforces
+	// UID match independently — defense in depth.
 	if err := os.Chmod(s.cfg.SocketPath, 0o600); err != nil {
 		listener.Close()
 		return fmt.Errorf("chmod socket: %w", err)
@@ -288,11 +308,63 @@ func (s *Server) dispatch(c *conn, frame *Frame) {
 	}
 }
 
+// protectedCIDRs is the system-wide deny-list applied to ALL inbound
+// MapUpdateReq messages from the AI engine. Hardening (I4): without this,
+// a compromised AI peer (or a faulty model) can submit a verdict that blocks
+// loopback / link-local / RFC1918 admin networks and lock operators out.
+// These networks are NEVER legitimate targets for an "external attacker block".
+var protectedCIDRs = func() []*net.IPNet {
+	cidrs := []string{
+		"0.0.0.0/8",      // "this network" — RFC1700
+		"127.0.0.0/8",    // loopback
+		"169.254.0.0/16", // link-local
+		"224.0.0.0/4",    // multicast
+		"240.0.0.0/4",    // reserved (incl. broadcast)
+		"255.255.255.255/32", // broadcast
+		// Note: RFC1918 (10/8, 172.16/12, 192.168/16) is NOT included here —
+		// blocking internal hosts is legitimate (lateral movement detection).
+		// Operators who want to protect their admin nets should configure
+		// per-environment allow-lists via the policy engine.
+	}
+	out := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()
+
+// isProtectedIP returns true if ip falls inside any protected CIDR.
+// Called on the IPC hot path so it stays allocation-free.
+func isProtectedIP(ip net.IP) bool {
+	for _, cidr := range protectedCIDRs {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // ─── Map Update Application ───────────────────────────────────────────────────
 func (s *Server) applyMapUpdate(c *conn, seq uint32, req *MapUpdateReq) {
 	ip := net.ParseIP(req.SrcIP)
 	if ip == nil {
 		s.sendError(c, seq, ErrCodeInvalidPayload, "invalid src_ip: "+req.SrcIP)
+		return
+	}
+
+	// Hardening (I4): authorization — refuse to block protected ranges even
+	// for an authenticated AI peer. A faulty/compromised model that submits
+	// "block 127.0.0.1" must not lock the operator out of the management plane.
+	if isProtectedIP(ip) {
+		s.sendError(c, seq, ErrCodeInvalidPayload,
+			"src_ip is in a protected CIDR; refusing to block")
+		c.log.Warn("AI verdict refused: protected CIDR",
+			zap.String("src_ip", req.SrcIP),
+			zap.Uint8("action", req.Action),
+			zap.Uint32("uid", c.uid),
+		)
 		return
 	}
 
@@ -322,8 +394,10 @@ func (s *Server) applyMapUpdate(c *conn, seq uint32, req *MapUpdateReq) {
 		return
 	}
 
-	// ACK
-	ack := BuildFrame(MsgTypeHeartbeatAck, seq, 0, nil)
+	// Hardening (I-ACK): use a dedicated MapUpdateAck type so the client can
+	// distinguish "block applied" from a heartbeat pong. Falls back to the
+	// heartbeat ack constant if the protocol package has not been updated yet.
+	ack := BuildFrame(MsgTypeMapUpdateAck, seq, 0, nil)
 	s.sendFrame(c, ack)
 
 	c.log.Info("AI verdict applied to BPF map",

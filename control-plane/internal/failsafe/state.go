@@ -257,12 +257,21 @@ func (cb *CircuitBreaker) IncrViolation(threshold int) bool {
 }
 
 // ResetViolation resets the hysteresis counter (traffic is normal).
+// Hardening: full reset to 0 (not decrement) — otherwise alternating
+// good/bad ticks oscillate around N-1 and never trip during sustained
+// moderate floods (audit finding F9).
 func (cb *CircuitBreaker) ResetViolation() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
-	if cb.violations > 0 {
-		cb.violations--
-	}
+	cb.violations = 0
+}
+
+// ResetTripCount clears the trip counter (used after long stable period).
+// Encapsulates the counter mutation so engine code doesn't reach into cb internals.
+func (cb *CircuitBreaker) ResetTripCount() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.tripCount = 0
 }
 
 // ─── Transition Events ────────────────────────────────────────────────────────

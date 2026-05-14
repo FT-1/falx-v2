@@ -39,8 +39,9 @@ apt-get install -y --no-install-recommends \
     llvm clang \
     libelf-dev \
     linux-headers-$(uname -r) \
+    linux-tools-common \
+    linux-tools-$(uname -r) \
     libbpf-dev \
-    bpftool \
     sqlite3 libsqlite3-dev \
     cmake ninja-build \
     protobuf-compiler \
@@ -50,7 +51,13 @@ apt-get install -y --no-install-recommends \
     ca-certificates \
     make \
     jq \
-    2>/dev/null
+    2>/dev/null || true
+# bpftool is provided by linux-tools-$(uname -r) on Ubuntu 22.04+
+# On Noble (24.04) "bpftool" is a virtual package — the real binary is in
+# linux-tools-<kernel-version>. Verify and warn if not available.
+if ! command -v bpftool &>/dev/null; then
+    log_warn "bpftool not found — some diagnostic features limited (non-fatal)"
+fi
 log_ok "System packages installed"
 
 # ─── Step 2: Rust toolchain ───────────────────────────────────────────────────

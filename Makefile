@@ -77,9 +77,11 @@ check-deps:
 	@command -v $(CMAKE)   >/dev/null 2>&1 || (echo "$(RED)[ERROR] cmake not found. Install CMake >= 3.20.$(RESET)"; exit 1)
 	@command -v $(PYTHON)  >/dev/null 2>&1 || (echo "$(RED)[ERROR] python3 not found.$(RESET)"; exit 1)
 	@command -v bpftool    >/dev/null 2>&1 || (echo "$(YELLOW)[WARN] bpftool not found. Some features may be limited.$(RESET)")
-	@$(RUSTUP) target list --toolchain nightly --installed | grep -q "bpfel-unknown-none" || \
-		(echo "$(YELLOW)[INFO] Installing bpf Rust target for nightly...$(RESET)" && \
-		 $(RUSTUP) target add bpfel-unknown-none --toolchain nightly)
+	@$(RUSTUP) component list --toolchain nightly --installed | grep -q "rust-src" || \
+		(echo "$(YELLOW)[INFO] Installing rust-src for nightly...$(RESET)" && \
+		 $(RUSTUP) component add rust-src --toolchain nightly)
+	@echo "$(GREEN)[INFO] bpfel-unknown-none is Tier 3 — no prebuilt artifacts.$(RESET)"
+	@echo "$(GREEN)[INFO] Build uses -Z build-std=core (no rustup target add needed).$(RESET)"
 	@echo "$(GREEN)[OK] All required dependencies found.$(RESET)"
 
 # ─── Dependency Installation ─────────────────────────────────────────────────
@@ -89,7 +91,9 @@ deps: deps-rust deps-go deps-python
 deps-rust:
 	@echo "$(CYAN)[RUST] Installing Rust dependencies...$(RESET)"
 	@$(RUSTUP) toolchain install nightly --component rust-src
-	@$(RUSTUP) target add bpfel-unknown-none --toolchain nightly
+	@# bpfel-unknown-none is Tier 3 — no prebuilt artifacts in rustup.
+	@# The build uses -Z build-std=core (builds core from source) so no
+	@# rustup target add is needed. rust-src component (above) is sufficient.
 	@cargo install bpf-linker 2>/dev/null || true
 
 deps-go:
@@ -119,6 +123,9 @@ build-ebpf:
 build-user:
 	@echo "$(CYAN)[USER] Building eBPF user-space loader...$(RESET)"
 	@mkdir -p $(BUILD_DIR)/user
+	@# Clean stale artifacts to prevent duplicate lang-item errors when the
+	@# active toolchain differs from what produced the cached .rmeta files.
+	@cd $(EBPF_USER_DIR) && $(CARGO) clean -q
 	@cd $(EBPF_USER_DIR) && $(CARGO) build --release
 	@cp $(EBPF_USER_DIR)/target/release/falx-user \
 		$(BUILD_DIR)/user/falx-user 2>/dev/null || true

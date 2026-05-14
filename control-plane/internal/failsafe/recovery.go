@@ -60,14 +60,27 @@ func NewRecoveryManager(cfg RecoveryConfig) *RecoveryManager {
 
 // CooldownFor computes the cooldown duration for a given trip count.
 // Uses exponential backoff capped at MaxCooldown.
+// Hardening (F8): cap the multiplier BEFORE pow/cast — otherwise
+// 2^N * BaseCooldown can overflow int64 around trips≈40 and produce
+// negative durations (recovery would either fire every tick or never).
 func (r *RecoveryManager) CooldownFor(tripCount int) time.Duration {
 	if tripCount <= 1 {
 		return r.cfg.BaseCooldown
 	}
-	// 2^(trips-1) * base, capped at max
-	multiplier := math.Pow(2.0, float64(tripCount-1))
+	// Compute the highest multiplier that would NOT overflow MaxCooldown.
+	// log2(MaxCooldown / BaseCooldown) gives the safe shift cap.
+	maxMult := float64(r.cfg.MaxCooldown) / float64(r.cfg.BaseCooldown)
+	if maxMult < 1 {
+		return r.cfg.BaseCooldown
+	}
+	maxShift := int(math.Log2(maxMult)) + 1
+	shift := tripCount - 1
+	if shift > maxShift {
+		shift = maxShift
+	}
+	multiplier := math.Pow(2.0, float64(shift))
 	d := time.Duration(float64(r.cfg.BaseCooldown) * multiplier)
-	if d > r.cfg.MaxCooldown {
+	if d > r.cfg.MaxCooldown || d < 0 {
 		d = r.cfg.MaxCooldown
 	}
 	return d

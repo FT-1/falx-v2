@@ -1,0 +1,13 @@
+# =============================================================================
+# Project: FALX V2
+# Lead Architect & Owner: FT-1
+# Description: Workspace-level Rust toolchain pin.
+#              Pins all crates (ebpf-kern, ebpf-user) to nightly so cargo
+#              never silently falls back to stable and produces stale-cache
+#              "duplicate lang item" errors.
+# =============================================================================
+
+[toolchain]
+channel  = "nightly"
+components = ["rust-src", "rustfmt", "clippy"]
+# bpfel-unknown-none is Tier 3 — no prebuilt target, built via -Z build-std=core

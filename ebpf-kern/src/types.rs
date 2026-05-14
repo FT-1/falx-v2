@@ -10,7 +10,6 @@
 //              All structs use repr(C) + packed to guarantee ABI stability.
 // =============================================================================
 
-use aya_ebpf::cty::c_uint;
 
 // ─── IPv4 Block Entry ──────────────────────────────────────────────────────────
 // Stored in BLOCKLIST_V4 map. Key = src_ip (u32, network byte order).

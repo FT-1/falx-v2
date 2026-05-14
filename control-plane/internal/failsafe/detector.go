@@ -109,6 +109,15 @@ func NewDetector(cfg DetectorConfig) *Detector {
 	}
 }
 
+// UpdateThresholds hot-swaps the pps/bps thresholds used by checkAbsolute.
+// Called from the engine's override path (applyOverride) which runs on the
+// engine's single polling goroutine — same goroutine as Analyze, so no lock
+// is needed here. EMA baseline state is preserved across the swap.
+func (d *Detector) UpdateThresholds(pps, bps uint64) {
+	d.cfg.PPSThreshold = pps
+	d.cfg.BPSThreshold = bps
+}
+
 // ─── Sample Processing ────────────────────────────────────────────────────────
 
 // Analyze processes one stats snapshot and returns all triggered detections.

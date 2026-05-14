@@ -25,14 +25,22 @@ package failsafe
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
+	"github.com/ft-1/falx-v2/control-plane/pkg/events"
 )
+
+// ErrEngineBusy is returned by ForceOpen/ForceClose/UpdateThresholds when the
+// engine's override channel is full — the engine goroutine is stalled and the
+// caller (typically a SOC API handler) MUST surface this rather than block.
+var ErrEngineBusy = errors.New("failsafe engine override channel full — try again")
 
 // ─── Engine Config ────────────────────────────────────────────────────────────
 type EngineConfig struct {
@@ -52,6 +60,7 @@ func DefaultEngineConfig() EngineConfig {
 
 // ─── Engine ───────────────────────────────────────────────────────────────────
 type Engine struct {
+	cfgMu    sync.RWMutex // Guards cfg.Detector (hot-reloaded via UpdateThresholds)
 	cfg      EngineConfig
 	mgr      *bpfmaps.Manager
 	cb       *CircuitBreaker
@@ -59,12 +68,17 @@ type Engine struct {
 	recovery *RecoveryManager
 	log      *zap.Logger
 
+	// Optional bus for cross-subsystem notifications (SOC dashboard, audit).
+	// nil-safe: all emit sites guard with `if e.bus != nil`.
+	bus *events.Bus
+
 	// Exposed channel for SOC backend to consume state transitions
 	Transitions <-chan StateTransition
 
 	// Counters for Prometheus metrics
-	totalTrips   atomic.Uint64
-	totalCloses  atomic.Uint64
+	totalTrips        atomic.Uint64
+	totalCloses       atomic.Uint64
+	bpfWriteFailures  atomic.Uint64 // F10: track BPF write errors (kernel/CP divergence)
 
 	// Manual override channel (SOC operator can force open/close)
 	overrideCh chan overrideCmd
@@ -74,9 +88,21 @@ type Engine struct {
 	halfOpenAt   time.Time
 }
 
+// overrideKind discriminates the override channel payload so a threshold-update
+// no longer accidentally triggers a Close() (audit finding F1).
+type overrideKind uint8
+
+const (
+	overrideForceOpen overrideKind = iota
+	overrideForceClose
+	overrideThresholdUpdate
+)
+
 type overrideCmd struct {
-	open   bool
-	reason string
+	kind         overrideKind
+	reason       string
+	ppsThreshold uint64 // valid only for overrideThresholdUpdate
+	bpsThreshold uint64
 }
 
 // ─── Constructor ──────────────────────────────────────────────────────────────
@@ -102,8 +128,33 @@ func NewEngine(cfg EngineConfig, mgr *bpfmaps.Manager, log *zap.Logger) *Engine 
 	return e
 }
 
+// SetBus wires an events.Bus so the engine can publish CircuitOpen/Closed
+// notifications for SOC dashboards. Must be called before Run.
+// Optional — nil bus disables external notifications (legacy callers).
+func (e *Engine) SetBus(bus *events.Bus) {
+	e.bus = bus
+}
+
+// publishTransition emits a Bus event for a state transition.
+// nil-safe: silently no-op if no bus was wired (audit finding F3).
+func (e *Engine) publishTransition(from, to CircuitState, reason string, pps uint64) {
+	if e.bus == nil {
+		return
+	}
+	switch to {
+	case StateOpen:
+		e.bus.Publish(events.CircuitOpenEvent(pps, reason))
+	case StateClosed:
+		e.bus.Publish(events.CircuitClosedEvent(pps))
+	}
+}
+
 // ─── Run ──────────────────────────────────────────────────────────────────────
 // Run starts the polling loop. Blocks until ctx is cancelled.
+// Hardening (F14): a defer/recover wrapper turns a tick panic into a logged
+// error + immediate restart rather than silently killing the entire failsafe
+// goroutine (which would leave the kernel autonomous detector as the only
+// remaining defense layer).
 func (e *Engine) Run(ctx context.Context) error {
 	e.log.Info("Failsafe engine started",
 		zap.Duration("poll_interval", e.cfg.PollInterval),
@@ -122,12 +173,36 @@ func (e *Engine) Run(ctx context.Context) error {
 			return nil
 
 		case cmd := <-e.overrideCh:
-			e.applyOverride(cmd)
+			e.safeApplyOverride(cmd)
 
 		case <-ticker.C:
-			e.tick()
+			e.safeTick()
 		}
 	}
+}
+
+// safeTick wraps tick() with panic recovery. A panic in the detector or BPF
+// read path must NOT kill the failsafe goroutine — without it, kernel
+// autonomous detection becomes the only line of defense (a single layer
+// instead of defense-in-depth).
+func (e *Engine) safeTick() {
+	defer func() {
+		if r := recover(); r != nil {
+			e.log.Error("Failsafe tick panicked — recovering",
+				zap.Any("panic", r))
+		}
+	}()
+	e.tick()
+}
+
+func (e *Engine) safeApplyOverride(cmd overrideCmd) {
+	defer func() {
+		if r := recover(); r != nil {
+			e.log.Error("Failsafe applyOverride panicked — recovering",
+				zap.Any("panic", r))
+		}
+	}()
+	e.applyOverride(cmd)
 }
 
 // ─── Main Poll Tick ───────────────────────────────────────────────────────────
@@ -165,10 +240,9 @@ func (e *Engine) tickClosed(stats bpfmaps.XdpStats) {
 	if !e.lastClosedAt.IsZero() && e.recovery.ShouldResetBackoff(e.lastClosedAt) {
 		if e.cb.TripCount() > 0 {
 			e.log.Info("Exponential backoff reset — circuit stable for required duration")
-			// Reset trip count via a synthetic close transition
-			e.cb.mu.Lock()
-			e.cb.tripCount = 0
-			e.cb.mu.Unlock()
+			// Hardening (F6): use the exported encapsulated reset so future
+			// CircuitBreaker locking-strategy changes don't silently break us.
+			e.cb.ResetTripCount()
 		}
 	}
 
@@ -278,10 +352,21 @@ func (e *Engine) openCircuit(r DetectionResult) {
 		zap.Int("trip_count", e.cb.TripCount()),
 	)
 
+	// F3: Emit Bus event so SOC dashboards / audit log see the transition.
+	e.publishTransition(StateClosed, StateOpen, r.Reason, r.CurrentPPS)
+
 	// Write to FAILSAFE_STATE BPF map — XDP will read this on next packet
 	if err := e.mgr.SetCircuitOpen(true, r.Reason); err != nil {
-		e.log.Error("Failed to open circuit in BPF map", zap.Error(err))
-		// Safety: kernel XDP already has autonomous detection as fallback
+		// F10: track BPF write failures (kernel/CP divergence).
+		// Defense-in-depth: kernel XDP has its own autonomous detector
+		// (main.rs:128-149) that opens the circuit if pps/bps exceeds its
+		// own thresholds. We rely on that as the safety net but loudly
+		// alert so operators can investigate the divergence.
+		e.bpfWriteFailures.Add(1)
+		e.log.Error("Failed to open circuit in BPF map — relying on kernel autonomous detection",
+			zap.Error(err),
+			zap.Uint64("bpf_write_failures_total", e.bpfWriteFailures.Load()),
+		)
 	}
 }
 
@@ -300,36 +385,85 @@ func (e *Engine) closeCircuit(pps, bps uint64) {
 		zap.Int("total_trips", e.cb.TripCount()),
 	)
 
+	// F3: Emit Bus event so SOC dashboards / audit log see the transition.
+	e.publishTransition(StateOpen, StateClosed, "traffic_normalized", pps)
+
 	// Write to FAILSAFE_STATE BPF map — XDP resumes passing to AI
 	if err := e.mgr.SetCircuitOpen(false, "traffic_normalized"); err != nil {
-		e.log.Error("Failed to close circuit in BPF map", zap.Error(err))
+		// F10: critical divergence — kernel may still be dropping while
+		// the control plane thinks the circuit is closed.
+		e.bpfWriteFailures.Add(1)
+		e.log.Error("Failed to close circuit in BPF map — kernel may still drop traffic",
+			zap.Error(err),
+			zap.Uint64("bpf_write_failures_total", e.bpfWriteFailures.Load()),
+		)
 	}
 }
 
 // ─── SOC Manual Override ──────────────────────────────────────────────────────
 
 // ForceOpen allows a SOC operator to manually open the circuit (emergency).
-func (e *Engine) ForceOpen(reason string) {
-	e.overrideCh <- overrideCmd{open: true, reason: "soc_manual:" + reason}
+// Hardening (F2): non-blocking send — if the engine goroutine is stalled
+// (e.g. blocked on a slow BPF syscall) the API handler MUST surface ErrEngineBusy
+// instead of blocking the operator's emergency lever.
+func (e *Engine) ForceOpen(reason string) error {
+	select {
+	case e.overrideCh <- overrideCmd{kind: overrideForceOpen, reason: "soc_manual:" + reason}:
+		return nil
+	default:
+		return ErrEngineBusy
+	}
 }
 
 // ForceClose allows a SOC operator to manually close the circuit.
-func (e *Engine) ForceClose(reason string) {
-	e.overrideCh <- overrideCmd{open: false, reason: "soc_manual:" + reason}
+func (e *Engine) ForceClose(reason string) error {
+	select {
+	case e.overrideCh <- overrideCmd{kind: overrideForceClose, reason: "soc_manual:" + reason}:
+		return nil
+	default:
+		return ErrEngineBusy
+	}
 }
 
 func (e *Engine) applyOverride(cmd overrideCmd) {
-	e.log.Warn("SOC manual circuit override",
-		zap.Bool("open", cmd.open),
-		zap.String("reason", cmd.reason),
-	)
-	if cmd.open {
-		e.cb.Trip(cmd.reason, 0, 0)
-		e.mgr.SetCircuitOpen(true, cmd.reason)
-	} else {
-		e.cb.Close(0, 0)
-		e.mgr.SetCircuitOpen(false, cmd.reason)
+	switch cmd.kind {
+
+	case overrideForceOpen:
+		e.log.Warn("SOC manual circuit OPEN", zap.String("reason", cmd.reason))
+		if e.cb.Trip(cmd.reason, 0, 0) {
+			e.publishTransition(StateClosed, StateOpen, cmd.reason, 0)
+		}
+		if err := e.mgr.SetCircuitOpen(true, cmd.reason); err != nil {
+			e.bpfWriteFailures.Add(1)
+			e.log.Error("ForceOpen BPF write failed", zap.Error(err))
+		}
+
+	case overrideForceClose:
+		e.log.Warn("SOC manual circuit CLOSE", zap.String("reason", cmd.reason))
+		if e.cb.Close(0, 0) {
+			e.publishTransition(StateOpen, StateClosed, cmd.reason, 0)
+		}
+		if err := e.mgr.SetCircuitOpen(false, cmd.reason); err != nil {
+			e.bpfWriteFailures.Add(1)
+			e.log.Error("ForceClose BPF write failed", zap.Error(err))
+		}
 		e.lastClosedAt = time.Now()
+
+	case overrideThresholdUpdate:
+		// F1: actually update the in-process detector config — the old code
+		// sent a misleading {open:false} cmd which spuriously closed the circuit
+		// AND never updated e.cfg.Detector / e.detector.cfg, so the detector
+		// kept using the original thresholds.
+		e.cfgMu.Lock()
+		e.cfg.Detector.PPSThreshold = cmd.ppsThreshold
+		e.cfg.Detector.BPSThreshold = cmd.bpsThreshold
+		e.detector.UpdateThresholds(cmd.ppsThreshold, cmd.bpsThreshold)
+		e.cfgMu.Unlock()
+		e.log.Info("Failsafe thresholds applied",
+			zap.Uint64("pps", cmd.ppsThreshold),
+			zap.Uint64("bps", cmd.bpsThreshold),
+			zap.String("reason", cmd.reason),
+		)
 	}
 }
 
@@ -372,18 +506,32 @@ func (e *Engine) Metrics() EngineMetrics {
 // ─── Thresholds Update (hot-reload without restart) ───────────────────────────
 // UpdateThresholds is safe to call concurrently: it sends the new config via
 // overrideCh so the engine's single polling goroutine applies it without races.
+// Hardening (F1): uses a dedicated overrideThresholdUpdate kind so it no longer
+// triggers a spurious circuit Close as a side-effect.
+// Hardening (F2): non-blocking — returns ErrEngineBusy if the engine is stalled
+// rather than blocking the SOC API handler forever.
 func (e *Engine) UpdateThresholds(ppsThr, bpsThr uint64) error {
-	// Apply in the engine goroutine via the override channel to avoid racing
-	// with tick() which reads e.cfg.Detector and e.detector concurrently.
-	e.overrideCh <- overrideCmd{
-		open:   false,
-		reason: fmt.Sprintf("threshold_update pps=%d bps=%d", ppsThr, bpsThr),
+	select {
+	case e.overrideCh <- overrideCmd{
+		kind:         overrideThresholdUpdate,
+		reason:       fmt.Sprintf("threshold_update pps=%d bps=%d", ppsThr, bpsThr),
+		ppsThreshold: ppsThr,
+		bpsThreshold: bpsThr,
+	}:
+	default:
+		return ErrEngineBusy
 	}
-	// Patch config through the safe path used by applyOverride.
-	// The actual detector rebuild happens in applyOverride on the engine goroutine.
 	e.log.Info("Failsafe threshold update queued",
 		zap.Uint64("pps_threshold", ppsThr),
 		zap.Uint64("bps_threshold", bpsThr),
 	)
+	// Also push to kernel so XDP's autonomous detector uses the same numbers.
 	return e.mgr.UpdateFailsafeThresholds(ppsThr, bpsThr)
+}
+
+// BPFWriteFailures exposes the running counter for Prometheus / SOC telemetry.
+// A non-zero value means the kernel and control-plane circuit views may have
+// diverged — operators should investigate.
+func (e *Engine) BPFWriteFailures() uint64 {
+	return e.bpfWriteFailures.Load()
 }

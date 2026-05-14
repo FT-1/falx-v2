@@ -57,6 +57,7 @@ const (
 	MsgTypeMapUpdateReq  MsgType = 0x82 // Request to update BPF map
 	MsgTypeHeartbeatAck  MsgType = 0x83 // Keepalive pong
 	MsgTypeAlert         MsgType = 0x84 // Threat alert (no block action needed)
+	MsgTypeMapUpdateAck  MsgType = 0x85 // ACK that a map update was applied
 
 	// Bidirectional
 	MsgTypeError         MsgType = 0xFF // Error response
@@ -70,6 +71,7 @@ func (m MsgType) String() string {
 	case MsgTypeInferResponse:  return "InferResponse"
 	case MsgTypeMapUpdateReq:   return "MapUpdateReq"
 	case MsgTypeHeartbeatAck:   return "HeartbeatAck"
+	case MsgTypeMapUpdateAck:   return "MapUpdateAck"
 	case MsgTypeAlert:          return "Alert"
 	case MsgTypeError:          return "Error"
 	default:                    return fmt.Sprintf("Unknown(0x%02x)", uint8(m))

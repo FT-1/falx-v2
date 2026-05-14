@@ -21,7 +21,6 @@ use aya_ebpf::maps::{
     LruHashMap,
     PerCpuArray,
     Array,
-    HashMap,
 };
 
 use crate::types::{BlockEntry, RateBucket, XdpStats, FailsafeState, FalxMapConfig};
