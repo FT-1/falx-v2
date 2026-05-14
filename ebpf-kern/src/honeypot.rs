@@ -178,8 +178,9 @@ fn compute_ip_checksum(ctx: &XdpContext, ip_offset: usize, ihl: usize) -> Result
     let words = ihl / 2;
     for i in 0..30usize {
         if i >= words { break; }
-        // Safety: bounds checked above
-        let word = unsafe { *(hdr_ptr.add(i)) } as u32;
+        // Safety: bounds checked above. Read as u16 first so from_be applies
+        // to a u16 value, THEN widen to u32 for the accumulator.
+        let word: u16 = unsafe { *(hdr_ptr.add(i)) };
         sum += u16::from_be(word) as u32;
     }
 

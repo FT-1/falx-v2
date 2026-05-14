@@ -98,22 +98,57 @@ thresholds — **defense in depth across two layers**.
 
 ## Quick Start
 
+> ⚠️ **Critical**: build (`make all`) must run as your **regular user** — `sudo`
+> strips `$PATH` so cargo and go would not be found. Install (`sudo make
+> install`) is a separate step that only copies pre-built binaries.
+
 ```bash
-# 1. Clone + build
+# 1. Clone
 git clone https://example.com/falx-v2.git && cd falx-v2
 
-# 2. Install all deps + build (Ubuntu 22.04/24.04, requires sudo)
+# 2. Install system deps + Rust + Go + BPF tooling (one-time, needs sudo)
 sudo bash scripts/setup.sh
 
-# 3. Start the daemon
-sudo systemctl enable --now falxd
+# 3. Reload your shell so cargo / go are in PATH
+source ~/.cargo/env
+source /etc/profile.d/golang.sh
 
-# 4. Open the SOC dashboard
+# 4. Build everything as YOUR user (NOT sudo — cargo / go need your PATH)
+make all
+ls -la dist/                 # → falxd  falx-soc  falx-ai
+
+# 5. Install binaries + systemd unit (now sudo, no compile needed)
+sudo make install
+
+# 6. EDIT THE INTERFACE NAME before starting the service:
+ip -br link                  # → look for your NIC: eth0 / enp0s3 / ens33 ...
+sudo nano /etc/falx/falx.toml
+# Change: iface = "eth0"  →  iface = "<your-actual-nic>"
+
+# 7. Start the daemon
+sudo systemctl daemon-reload
+sudo systemctl enable --now falxd
+sudo journalctl -fu falxd    # tail logs — Ctrl+C when you've seen it start
+
+# 8. Open the SOC dashboard
 xdg-open http://localhost:8080
 ```
 
 Default admin credentials are printed once on first start. Change them
 immediately via the dashboard.
+
+### Common first-run errors
+
+| Error message | Cause | Fix |
+|---|---|---|
+| `[ERROR] cargo not found. Install Rust toolchain.` after `sudo make ...` | `sudo` strips PATH; cargo is in your user's `~/.cargo/bin` | Run `make all` as your regular user, then `sudo make install` |
+| `Unit file falxd.service does not exist` | `make install` was never completed | Run `make all` first, then `sudo make install` |
+| `Failed to attach XDP to 'eth0'` | NIC name in config doesn't match host | Edit `iface` in `/etc/falx/falx.toml` to match `ip -br link` output |
+| `Failed to attach XDP … driver does not support native mode` | NIC lacks native XDP support (common on VMs) | Set `[xdp].mode = "skb"` in `falx.toml` |
+| `BPF filesystem not mounted at /sys/fs/bpf` | BPF FS not mounted | `sudo mount -t bpf bpf /sys/fs/bpf` + add to `/etc/fstab` |
+| `error: toolchain 'nightly' has no prebuilt artifacts available for target 'bpfel-unknown-none'` | Tier-3 target — `rustup target add` cannot install it | DO NOT add the target. Just install `rust-src`: `rustup component add rust-src --toolchain nightly`. Build uses `-Z build-std=core` |
+| `error[E0152]: duplicate lang item in crate core: sized` | Stale `target/` from a previous toolchain | `cd ebpf-user && cargo clean && cd .. && make all` |
+| `Package 'bpftool' has no installation candidate` (Ubuntu 24.04) | Virtual package on Noble | The setup script installs `linux-tools-$(uname -r)` automatically. Re-run `sudo bash scripts/setup.sh` |
 
 ---
 
@@ -177,31 +212,49 @@ rustup component add rust-src --toolchain nightly
 cargo install bpf-linker
 ```
 
-### Step 5 — Build everything
+### Step 5 — Build everything (as your REGULAR user — NOT sudo)
 
 ```bash
 cd ~/FALX-V2          # or wherever you cloned the repo
 make all              # ≈ 5–10 minutes the first time
 
 # Outputs:
-ls -la dist/          # falxd  falx-soc  falx-ai
-ls -la build/ebpf/    # falx.bpf.o (the XDP program object)
+ls -la dist/          # → falxd  falx-soc  falx-ai
+ls -la build/ebpf/    # → falx.bpf.o (the XDP program object)
 ```
 
-### Step 6 — Install and run as a system service
+> ⚠️ Never run `sudo make all`. `sudo` strips your PATH so cargo and go
+> become invisible to make, and you'll see: `[ERROR] cargo not found`.
+
+### Step 6 — Install binaries + systemd unit (now sudo, no compile)
 
 ```bash
 sudo make install                       # → /usr/local/bin + /etc/falx/
-sudo nano /etc/falx/falx.toml           # set [general].iface = "eth0" (or your NIC)
+```
+
+This step is pure file copy — it refuses to run if `dist/falxd` is missing
+(it will tell you to do Step 5 first).
+
+### Step 7 — Configure your NIC, then start the service
+
+```bash
+ip -br link                             # find your interface name
+sudo nano /etc/falx/falx.toml           # set [general].iface = <your-nic>
+
+# If your NIC driver does NOT support native XDP (common on VMs / virtio):
+#   [xdp]
+#   mode = "skb"
+
+sudo systemctl daemon-reload
 sudo systemctl enable --now falxd
-sudo journalctl -fu falxd               # tail logs
+sudo journalctl -fu falxd               # tail logs (Ctrl+C to exit)
 ```
 
 **Verify** the XDP program is attached:
 
 ```bash
 sudo bpftool prog show     # look for "falx_xdp" of type xdp
-sudo bpftool map list      # 9 pinned maps under /sys/fs/bpf/falx
+sudo bpftool map list      # 9 pinned maps under /sys/fs/bpf/falx/
 ```
 
 ---

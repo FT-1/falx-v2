@@ -223,7 +223,18 @@ fmt-go:
 	@$(GO) fmt $(SOC_DIR)/...
 
 # ─── Install / Uninstall ──────────────────────────────────────────────────────
-install: all
+# install does NOT depend on `all` — building requires cargo/go in the caller's
+# PATH which sudo strips. The expected workflow is:
+#   1) make all              (as regular user, builds with cargo/go in PATH)
+#   2) sudo make install     (as root, only copies pre-built binaries)
+install:
+	@# Pre-flight: refuse to run if the binaries haven't been built yet.
+	@if [ ! -f $(FALXD_BIN) ]; then \
+		echo "$(RED)[ERROR] $(FALXD_BIN) not found.$(RESET)"; \
+		echo "$(YELLOW)        Run 'make all' as your regular user FIRST,$(RESET)"; \
+		echo "$(YELLOW)        THEN re-run 'sudo make install'.$(RESET)"; \
+		exit 1; \
+	fi
 	@echo "$(CYAN)[INSTALL] Installing FALX V2 system components...$(RESET)"
 	@install -Dm755 $(FALXD_BIN) /usr/local/bin/falxd
 	@install -Dm755 $(AI_BIN)   /usr/local/bin/falx-ai   2>/dev/null || true
@@ -231,7 +242,7 @@ install: all
 	@install -Dm644 $(CONFIGS_DIR)/falx.toml /etc/falx/falx.toml
 	@install -Dm644 $(SCRIPTS_DIR)/falxd.service /etc/systemd/system/falxd.service
 	@systemctl daemon-reload
-	@echo "$(GREEN)[OK] FALX V2 installed. Run: systemctl start falxd$(RESET)"
+	@echo "$(GREEN)[OK] FALX V2 installed. Run: systemctl enable --now falxd$(RESET)"
 
 uninstall:
 	@systemctl stop falxd 2>/dev/null || true
