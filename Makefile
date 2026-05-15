@@ -67,8 +67,12 @@ all: check-deps build-ebpf build-user build-control-plane build-ai build-soc
 	@echo "$(GREEN)$(BOLD)[FALX V2] Full build complete. Version: $(VERSION)$(RESET)"
 
 # ─── Development Target (faster rebuild) ─────────────────────────────────────
-dev: build-ebpf build-user build-control-plane
-	@echo "$(CYAN)[FALX V2] Dev build complete (AI/SOC skipped)$(RESET)"
+# Includes build-soc because deploy.sh's health check probes :8080 (served by
+# the SOC backend). Without it, the deploy rolls back even when falxd is fine.
+# Only build-ai is skipped here — it's the heavy C++/CMake step that depends
+# on spdlog/nlohmann_json and isn't required for the IPS datapath to function.
+dev: build-ebpf build-user build-control-plane build-soc
+	@echo "$(CYAN)[FALX V2] Dev build complete (AI inference skipped)$(RESET)"
 
 # ─── Release Target ──────────────────────────────────────────────────────────
 release: clean all
