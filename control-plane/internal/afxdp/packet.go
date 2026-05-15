@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 // =============================================================================
 // Project: FALX V2
 // Lead Architect & Owner: FT-1

@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 // =============================================================================
 // Project: FALX V2
 // Lead Architect & Owner: FT-1
@@ -215,8 +218,12 @@ func (xsk *XDPSocket) CompRing() *Ring { return xsk.compRing }
 
 // ─── Wakeup (required when NeedsWakeup flag is set) ──────────────────────────
 // Triggers the kernel to process the TX ring via a zero-data sendmsg.
+// We use SendmsgN (not Sendmsg) because Sendmsg returns only `error`,
+// while SendmsgN returns `(n int, err error)`. The wakeup path sends no
+// payload (n is always 0). EAGAIN / ENOBUFS are non-fatal — they mean
+// the kernel is already processing and the next batch will retry.
 func (xsk *XDPSocket) Wakeup() error {
-	_, err := unix.Sendmsg(xsk.fd, nil, nil, nil, unix.MSG_DONTWAIT)
+	_, err := unix.SendmsgN(xsk.fd, nil, nil, nil, unix.MSG_DONTWAIT)
 	if err == unix.EAGAIN || err == unix.ENOBUFS {
 		return nil // Non-fatal: retry on next batch
 	}
