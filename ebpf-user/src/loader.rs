@@ -40,7 +40,16 @@ use crate::types::{FailsafeState, FalxMapConfig};
 // The BPF .o file is compiled by build.rs and embedded here.
 // At runtime, no external file access is needed.
 // NOTE: Path is relative to the build artifact — adjusted by aya-build.
-static BPF_OBJECT: &[u8] = include_bytes!(
+//
+// MUST use aya::include_bytes_aligned! (not std's include_bytes!): the `object`
+// crate that aya uses to parse the embedded ELF requires the byte slice to be
+// 8-byte aligned and rejects byte-aligned slices with
+// "Invalid ELF header size or alignment" (surfaced through aya as
+// ParseError::ElfError → "error parsing ELF data"). include_bytes!  produces
+// a &[u8; N] with alignment 1 — anchoring the bytes inside an
+// #[repr(align(32))] wrapper (what include_bytes_aligned! does) gives the
+// parser the alignment it needs.
+static BPF_OBJECT: &[u8] = aya::include_bytes_aligned!(
     concat!(env!("OUT_DIR"), "/falx-kern.bpf.o")
 );
 
