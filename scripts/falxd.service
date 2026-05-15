@@ -16,6 +16,11 @@ After=network-online.target falx-user.service
 Wants=network-online.target
 # Ensure BPF filesystem is mounted
 RequiresMountsFor=/sys/fs/bpf
+# StartLimit* live in [Unit], not [Service] — systemd silently ignores them
+# when placed in [Service], which disables rate-limiting and lets a broken
+# unit restart-spam thousands of times.
+StartLimitIntervalSec=60
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -36,8 +41,6 @@ TimeoutStopSec=30
 # Restart policy: always restart unless manually stopped
 Restart=on-failure
 RestartSec=5s
-StartLimitIntervalSec=60
-StartLimitBurst=3
 
 # ── Hardening ─────────────────────────────────────────────────────────────────
 # BPF requires these capabilities
@@ -61,7 +64,9 @@ RuntimeDirectory=falx
 StateDirectory=falx
 ReadWritePaths=/sys/fs/bpf
 ProtectHome=yes
-ProtectKernelTunables=no  # Required for BPF map operations
+# ProtectKernelTunables=no — required for BPF map operations (systemd would
+# parse "no  # ..." as the value, so the comment must live on its own line)
+ProtectKernelTunables=no
 ProtectControlGroups=yes
 LockPersonality=yes
 RestrictRealtime=yes
@@ -70,8 +75,10 @@ SystemCallFilter=@system-service @network-io @basic-io bpf perf_event_open
 
 # Resource limits
 LimitNOFILE=1048576
-LimitMEMLOCK=infinity    # Required for UMEM mmap(MAP_LOCKED)
-OOMScoreAdjust=-900      # Prefer to kill other processes during OOM
+# LimitMEMLOCK=infinity required for UMEM mmap(MAP_LOCKED)
+LimitMEMLOCK=infinity
+# OOMScoreAdjust=-900 — prefer to kill other processes during OOM
+OOMScoreAdjust=-900
 
 # Logging
 StandardOutput=journal

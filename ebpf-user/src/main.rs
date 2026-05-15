@@ -23,7 +23,8 @@ mod types;
 use anyhow::{Context, Result};
 use clap::Parser;
 use log::{info, warn};
-use std::path::PathBuf;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time;
 
@@ -31,6 +32,12 @@ use loader::{FalxHandle, LoaderConfig, MapManager, XdpAttachMode};
 use types::{FailsafeState, FalxMapConfig, action};
 
 // ─── CLI Arguments ────────────────────────────────────────────────────────────
+// iface / mode / pin_path are Option<T> (no clap default_value) so we can
+// distinguish "user passed --iface X" from "user didn't pass --iface". The
+// resolution order is: CLI explicit > /etc/falx/falx.toml > hardcoded fallback.
+// This was changed from clap defaults because the unit file's `--config` arg
+// would parse fine but the file was never actually read, so config edits had
+// no effect and falx-user always used "eth0" / "native" regardless of falx.toml.
 #[derive(Debug, Parser)]
 #[command(
     name    = "falx-user",
@@ -38,20 +45,20 @@ use types::{FailsafeState, FalxMapConfig, action};
     version = "0.2.0"
 )]
 pub struct Args {
-    #[arg(short = 'i', long, default_value = "eth0")]
-    pub iface: String,
+    #[arg(short = 'i', long)]
+    pub iface: Option<String>,
 
     #[arg(short = 'c', long, default_value = "/etc/falx/falx.toml")]
     pub config: PathBuf,
 
-    #[arg(short = 'm', long, value_enum, default_value = "native")]
-    pub mode: CliXdpMode,
+    #[arg(short = 'm', long, value_enum)]
+    pub mode: Option<CliXdpMode>,
 
     #[arg(short = 'v', long, action = clap::ArgAction::SetTrue)]
     pub verbose: bool,
 
-    #[arg(long, default_value = "/sys/fs/bpf/falx")]
-    pub pin_path: PathBuf,
+    #[arg(long)]
+    pub pin_path: Option<PathBuf>,
 
     /// Packets per second threshold to trigger circuit breaker
     #[arg(long, default_value = "1000000")]
@@ -79,6 +86,56 @@ impl From<CliXdpMode> for XdpAttachMode {
     }
 }
 
+// ─── Config File Schema ──────────────────────────────────────────────────────
+// Mirrors the subset of /etc/falx/falx.toml that the loader cares about.
+// Every field is optional so a partial config or a missing section is fine.
+#[derive(Debug, Default, Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    general: GeneralSection,
+    #[serde(default)]
+    xdp:     XdpSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GeneralSection {
+    iface:    Option<String>,
+    pin_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct XdpSection {
+    mode: Option<String>,
+}
+
+fn load_config_file(path: &Path) -> ConfigFile {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("Config '{}' not readable ({}) — falling back to CLI/hardcoded defaults",
+                  path.display(), e);
+            return ConfigFile::default();
+        }
+    };
+    match toml::from_str::<ConfigFile>(&content) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            warn!("Failed to parse '{}': {} — falling back to CLI/hardcoded defaults",
+                  path.display(), e);
+            ConfigFile::default()
+        }
+    }
+}
+
+fn parse_mode(s: &str) -> Option<XdpAttachMode> {
+    match s {
+        "native"  => Some(XdpAttachMode::Native),
+        "skb"     => Some(XdpAttachMode::Skb),
+        "offload" => Some(XdpAttachMode::Offload),
+        _         => None,
+    }
+}
+
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -88,8 +145,31 @@ async fn main() -> Result<()> {
     // Verify root / CAP_BPF
     check_privileges()?;
 
+    // Resolve iface / mode / pin_path. Precedence: CLI explicit > falx.toml > fallback.
+    let cfg_file = load_config_file(&args.config);
+
+    let iface = args.iface.clone()
+        .or_else(|| cfg_file.general.iface.clone())
+        .unwrap_or_else(|| "eth0".to_string());
+
+    let xdp_mode: XdpAttachMode = if let Some(m) = args.mode.clone() {
+        m.into()
+    } else if let Some(m_str) = cfg_file.xdp.mode.as_deref() {
+        parse_mode(m_str).unwrap_or_else(|| {
+            warn!("Unknown XDP mode '{}' in config — defaulting to native", m_str);
+            XdpAttachMode::Native
+        })
+    } else {
+        XdpAttachMode::Native
+    };
+
+    let pin_path = args.pin_path.clone()
+        .or_else(|| cfg_file.general.pin_path.clone())
+        .unwrap_or_else(|| PathBuf::from("/sys/fs/bpf/falx"));
+
     info!("=== FALX V2 eBPF Loader | Lead Architect: FT-1 | v0.2.0 ===");
-    info!("Target interface: {} | XDP mode: {:?}", args.iface, args.mode);
+    info!("Config: {} | iface={} | mode={:?} | pin_path={}",
+          args.config.display(), iface, xdp_mode, pin_path.display());
 
     // ── Build Loader Config ────────────────────────────────────────────────────
     let map_config = FalxMapConfig {
@@ -117,9 +197,9 @@ async fn main() -> Result<()> {
     };
 
     let loader_cfg = LoaderConfig {
-        iface:         args.iface.clone(),
-        xdp_mode:      args.mode.clone().into(),
-        pin_path:      args.pin_path.clone(),
+        iface:         iface.clone(),
+        xdp_mode,
+        pin_path:      pin_path.clone(),
         map_config,
         failsafe_init,
     };
@@ -129,10 +209,10 @@ async fn main() -> Result<()> {
         .with_context(|| format!(
             "Failed to load XDP program on '{}'. \
              Check: kernel >= 5.15, interface exists, running as root.",
-            args.iface
+            iface,
         ))?;
 
-    let map_mgr = MapManager::new(args.pin_path.clone());
+    let map_mgr = MapManager::new(pin_path);
 
     // ── Run Stats Polling + Signal Handler ────────────────────────────────────
     run_event_loop(handle, map_mgr).await?;

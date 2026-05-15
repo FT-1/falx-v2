@@ -41,6 +41,17 @@
 #![allow(dead_code)]
 #![allow(static_mut_refs)]
 
+// ─── BPF License Section ──────────────────────────────────────────────────────
+// MUST be present and named exactly `license` for Aya's ELF parser to accept
+// the object (without it, `Ebpf::load()` fails with "error parsing ELF data")
+// and for the kernel verifier to allow calls to GPL-only helpers — which
+// includes bpf_ktime_get_ns() and every map helper we use. `#[used]` keeps
+// LTO from stripping the symbol since nothing in Rust source references it.
+#[used]
+#[no_mangle]
+#[link_section = "license"]
+pub static LICENSE: [u8; 4] = *b"GPL\0";
+
 mod types;
 mod maps;
 mod parser;
