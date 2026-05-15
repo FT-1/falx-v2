@@ -45,7 +45,18 @@ CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
 NoNewPrivileges=no
 PrivateTmp=yes
 ProtectSystem=strict
-ReadWritePaths=/etc/falx /var/log/falx /var/run/falx /var/lib/falx /sys/fs/bpf
+# systemd auto-creates these with correct ownership and makes them RW under
+# the namespace, even with ProtectSystem=strict:
+#   ConfigurationDirectory=falx → /etc/falx
+#   LogsDirectory=falx          → /var/log/falx
+#   RuntimeDirectory=falx       → /run/falx  (symlinked from /var/run/falx)
+#   StateDirectory=falx         → /var/lib/falx
+# /sys/fs/bpf is a pre-existing kernel mount, so it stays in ReadWritePaths.
+ConfigurationDirectory=falx
+LogsDirectory=falx
+RuntimeDirectory=falx
+StateDirectory=falx
+ReadWritePaths=/sys/fs/bpf
 ProtectHome=yes
 ProtectKernelTunables=no  # Required for BPF map operations
 ProtectControlGroups=yes

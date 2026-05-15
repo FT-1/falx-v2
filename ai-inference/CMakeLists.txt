@@ -52,7 +52,7 @@ if(NOT spdlog_FOUND)
     FetchContent_Declare(
         spdlog
         URL      https://github.com/gabime/spdlog/archive/refs/tags/v1.13.0.tar.gz
-        URL_HASH SHA256=9735f9c969fbe82bf6177e328ec6d1e3cd8f823b7ec61c2843e2e735ad8f9ef8
+        URL_HASH SHA256=534f2ee1a4dcbeb22249856edfb2be76a1cf4f708a20b0ac2ed090ee24cfdbc9
     )
     FetchContent_MakeAvailable(spdlog)
 endif()
