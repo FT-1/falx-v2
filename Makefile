@@ -34,6 +34,7 @@ CONFIGS_DIR     := $(ROOT_DIR)/configs
 
 # Build targets
 FALXD_BIN       := $(DIST_DIR)/falxd
+FALX_USER_BIN   := $(BUILD_DIR)/user/falx-user
 AI_BIN          := $(DIST_DIR)/falx-ai
 SOC_BIN         := $(DIST_DIR)/falx-soc
 
@@ -76,6 +77,7 @@ check-deps:
 	@command -v $(CLANG)   >/dev/null 2>&1 || (echo "$(RED)[ERROR] clang not found. Install LLVM/Clang.$(RESET)"; exit 1)
 	@command -v $(CMAKE)   >/dev/null 2>&1 || (echo "$(RED)[ERROR] cmake not found. Install CMake >= 3.20.$(RESET)"; exit 1)
 	@command -v $(PYTHON)  >/dev/null 2>&1 || (echo "$(RED)[ERROR] python3 not found.$(RESET)"; exit 1)
+	@command -v bpf-linker >/dev/null 2>&1 || (echo "$(RED)[ERROR] bpf-linker not found. Run 'make deps-rust' or 'cargo install bpf-linker'.$(RESET)"; exit 1)
 	@command -v bpftool    >/dev/null 2>&1 || (echo "$(YELLOW)[WARN] bpftool not found. Some features may be limited.$(RESET)")
 	@$(RUSTUP) component list --toolchain nightly --installed | grep -q "rust-src" || \
 		(echo "$(YELLOW)[INFO] Installing rust-src for nightly...$(RESET)" && \
@@ -243,20 +245,32 @@ install:
 		echo "$(YELLOW)        THEN re-run 'sudo make install'.$(RESET)"; \
 		exit 1; \
 	fi
+	@if [ ! -f $(FALX_USER_BIN) ]; then \
+		echo "$(RED)[ERROR] $(FALX_USER_BIN) not found.$(RESET)"; \
+		echo "$(YELLOW)        The eBPF loader is required: falxd opens pinned maps$(RESET)"; \
+		echo "$(YELLOW)        that falx-user creates. Run 'make build-user' (or$(RESET)"; \
+		echo "$(YELLOW)        'make all') first, then re-run 'sudo make install'.$(RESET)"; \
+		exit 1; \
+	fi
 	@echo "$(CYAN)[INSTALL] Installing FALX V2 system components...$(RESET)"
-	@install -Dm755 $(FALXD_BIN) /usr/local/bin/falxd
-	@install -Dm755 $(AI_BIN)   /usr/local/bin/falx-ai   2>/dev/null || true
-	@install -Dm755 $(SOC_BIN)  /usr/local/bin/falx-soc  2>/dev/null || true
-	@install -Dm644 $(CONFIGS_DIR)/falx.toml /etc/falx/falx.toml
-	@install -Dm644 $(SCRIPTS_DIR)/falxd.service /etc/systemd/system/falxd.service
+	@install -Dm755 $(FALXD_BIN)     /usr/local/bin/falxd
+	@install -Dm755 $(FALX_USER_BIN) /usr/local/bin/falx-user
+	@install -Dm755 $(AI_BIN)        /usr/local/bin/falx-ai   2>/dev/null || true
+	@install -Dm755 $(SOC_BIN)       /usr/local/bin/falx-soc  2>/dev/null || true
+	@install -Dm644 $(CONFIGS_DIR)/falx.toml                  /etc/falx/falx.toml
+	@install -Dm644 $(SCRIPTS_DIR)/falx-user.service          /etc/systemd/system/falx-user.service
+	@install -Dm644 $(SCRIPTS_DIR)/falxd.service              /etc/systemd/system/falxd.service
 	@systemctl daemon-reload
 	@echo "$(GREEN)[OK] FALX V2 installed. Run: systemctl enable --now falxd$(RESET)"
+	@echo "$(GREEN)     (falx-user.service is pulled in automatically via Requires=)$(RESET)"
 
 uninstall:
-	@systemctl stop falxd 2>/dev/null || true
-	@systemctl disable falxd 2>/dev/null || true
-	@rm -f /usr/local/bin/falxd /usr/local/bin/falx-ai /usr/local/bin/falx-soc
-	@rm -f /etc/systemd/system/falxd.service
+	@systemctl stop falxd      2>/dev/null || true
+	@systemctl stop falx-user  2>/dev/null || true
+	@systemctl disable falxd      2>/dev/null || true
+	@systemctl disable falx-user  2>/dev/null || true
+	@rm -f /usr/local/bin/falxd /usr/local/bin/falx-user /usr/local/bin/falx-ai /usr/local/bin/falx-soc
+	@rm -f /etc/systemd/system/falxd.service /etc/systemd/system/falx-user.service
 	@rm -rf /etc/falx/
 	@systemctl daemon-reload
 	@echo "$(GREEN)[OK] FALX V2 uninstalled.$(RESET)"

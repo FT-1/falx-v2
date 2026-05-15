@@ -23,8 +23,6 @@ endif()
 add_compile_options(
     -Wall -Wextra -Wpedantic
     -Wno-unused-parameter
-    $<$<CONFIG:Release>:-O3 -march=native -DNDEBUG>
-    $<$<CONFIG:Debug>:-O0 -g -fsanitize=address,undefined>
 )
 
 # ─── Find Dependencies ────────────────────────────────────────────────────────

@@ -1,20 +1,30 @@
 # =============================================================================
 # Project: FALX V2
 # Lead Architect & Owner: FT-1
-# Description: systemd service unit (scripts/falxd.service).
-#              Install: cp scripts/falxd.service /etc/systemd/system/
-#              Enable:  systemctl daemon-reload && systemctl enable --now falxd
+# Description: systemd service for the eBPF/XDP loader (scripts/falx-user.service).
+#              Loads the kernel program, attaches it to the configured
+#              interface, and pins maps under /sys/fs/bpf/falx/. Must be
+#              running before falxd.service so the control plane can open
+#              the pinned maps.
+#
+#              Install: cp scripts/falx-user.service /etc/systemd/system/
+#              Enable:  systemctl daemon-reload && systemctl enable --now falx-user
+#
+#              To override the interface or XDP mode without editing this file,
+#              drop a unit override:
+#                  systemctl edit falx-user
+#              and set, e.g.:
+#                  [Service]
+#                  ExecStart=
+#                  ExecStart=/usr/local/bin/falx-user --config /etc/falx/falx.toml -i ens33 -m skb
 # =============================================================================
 
 [Unit]
-Description=FALX V2 Hybrid IPS Daemon
+Description=FALX V2 eBPF/XDP Loader (pins maps to /sys/fs/bpf/falx)
 Documentation=https://github.com/ft-1/falx-v2
-# falx-user.service must be running first: it loads the BPF program and pins
-# the maps under /sys/fs/bpf/falx that this daemon opens by path.
-Requires=falx-user.service
-After=network-online.target falx-user.service
+After=network-online.target
 Wants=network-online.target
-# Ensure BPF filesystem is mounted
+# Ensure BPF filesystem is mounted before we try to pin into it
 RequiresMountsFor=/sys/fs/bpf
 
 [Service]
@@ -23,28 +33,24 @@ User=root
 Group=root
 WorkingDirectory=/var/lib/falx
 
-ExecStart=/usr/local/bin/falxd \
-    --config /etc/falx/falx.toml \
-    --log-level info
+ExecStart=/usr/local/bin/falx-user \
+    --config /etc/falx/falx.toml
 
 ExecReload=/bin/kill -HUP $MAINPID
 ExecStop=/bin/kill -TERM $MAINPID
 
-# Allow falxd 30 seconds to shut down gracefully
 TimeoutStopSec=30
 
-# Restart policy: always restart unless manually stopped
 Restart=on-failure
 RestartSec=5s
 StartLimitIntervalSec=60
 StartLimitBurst=3
 
 # ── Hardening ─────────────────────────────────────────────────────────────────
-# BPF requires these capabilities
+# BPF/XDP attach requires these capabilities
 AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
 CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
 
-# Lock down the rest
 NoNewPrivileges=no
 PrivateTmp=yes
 ProtectSystem=strict
@@ -54,7 +60,8 @@ ProtectSystem=strict
 #   LogsDirectory=falx          → /var/log/falx
 #   RuntimeDirectory=falx       → /run/falx  (symlinked from /var/run/falx)
 #   StateDirectory=falx         → /var/lib/falx
-# /sys/fs/bpf is a pre-existing kernel mount, so it stays in ReadWritePaths.
+# /sys/fs/bpf is a pre-existing kernel mount, so it stays in ReadWritePaths;
+# the loader creates the /sys/fs/bpf/falx/ subdir on first start.
 ConfigurationDirectory=falx
 LogsDirectory=falx
 RuntimeDirectory=falx
@@ -70,13 +77,13 @@ SystemCallFilter=@system-service @network-io @basic-io bpf perf_event_open
 
 # Resource limits
 LimitNOFILE=1048576
-LimitMEMLOCK=infinity    # Required for UMEM mmap(MAP_LOCKED)
+LimitMEMLOCK=infinity    # Required for BPF map allocation
 OOMScoreAdjust=-900      # Prefer to kill other processes during OOM
 
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=falxd
+SyslogIdentifier=falx-user
 
 [Install]
 WantedBy=multi-user.target
