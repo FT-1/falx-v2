@@ -94,7 +94,16 @@ pub async fn load_and_attach(cfg: &LoaderConfig) -> Result<FalxHandle> {
     );
 
     // ── Load BPF Object from embedded bytes ───────────────────────────────────
+    // aya's ParseError::ElfError variant has no #[source] annotation, so
+    // anyhow's chain walker stops at "error parsing ELF data" and hides the
+    // real underlying cause (CreateError + EPERM, RelocationError, etc.).
+    // Logging Debug here exposes the actual variant + os_error to the journal
+    // before we propagate; otherwise operators are stuck guessing.
     let mut ebpf = Ebpf::load(BPF_OBJECT)
+        .map_err(|e| {
+            log::error!("aya::Ebpf::load failed — full debug chain:\n{:#?}", e);
+            e
+        })
         .context("Failed to load BPF object. Ensure kernel >= 5.15 and CAP_BPF")?;
 
     // ── Initialize BPF Logger ──────────────────────────────────────────────────

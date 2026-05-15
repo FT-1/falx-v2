@@ -72,6 +72,12 @@ DIST="$ROOT_DIR/dist"
 for bin in falxd falx-soc falx-ai; do
     [[ -f "$DIST/$bin" ]] && install -m755 "$DIST/$bin" "$REL/bin/$bin" && info "→ $bin"
 done
+# falx-user lives under build/user/, not dist/ — without this it never gets
+# installed and falxd is left looking at a stale /usr/local/bin/falx-user (or
+# nothing). That's why the loader hash on the running system could lag the
+# source tree by an arbitrary amount.
+FALX_USER_SRC="$ROOT_DIR/build/user/falx-user"
+[[ -f "$FALX_USER_SRC" ]] && install -m755 "$FALX_USER_SRC" "$REL/bin/falx-user" && info "→ falx-user"
 [[ -f "$ROOT_DIR/build/ebpf/falx.bpf.o" ]] && cp "$ROOT_DIR/build/ebpf/falx.bpf.o" "$REL/bpf/"
 [[ -d "$ROOT_DIR/soc-backend/dashboard" ]]   && cp -r "$ROOT_DIR/soc-backend/dashboard/." "$REL/dashboard/"
 
@@ -91,9 +97,9 @@ for f in falx.toml honeypot.toml notifications.toml; do
     [[ ! -f "/etc/falx/$f" && -f "$ROOT_DIR/configs/$f" ]] && \
         install -m640 "$ROOT_DIR/configs/$f" "/etc/falx/$f" && info "Installed: /etc/falx/$f"
 done
-[[ ! -f /var/lib/falx/policy.db && -f "$ROOT_DIR/configs/default_policy_rules.sql" ]] && \
-    sqlite3 /var/lib/falx/policy.db < "$ROOT_DIR/configs/default_policy_rules.sql" && \
-    ok "Policy DB seeded"
+# NOTE: policy DB seeding moved to step 7b (after services start). The `rules`
+# table is created by falxd's migrate() on startup, so seeding from this stage
+# was always failing with "no such table: rules".
 
 # ─── 4b. Interface & XDP mode (interactive) ───────────────────────────────────
 # Patch /etc/falx/falx.toml's iface= and mode= to match the operator's NIC.
@@ -144,17 +150,21 @@ step "Switchover"
 PREV_REL=""
 [[ -L /opt/falx/current ]] && PREV_REL=$(readlink /opt/falx/current)
 
-for bin in falxd falx-soc falx-ai; do
+for bin in falxd falx-user falx-soc falx-ai; do
     [[ -f "$REL/bin/$bin" ]] && \
         cp "/usr/local/bin/$bin" "/usr/local/bin/$bin.prev" 2>/dev/null || true
     [[ -f "$REL/bin/$bin" ]] && install -m755 "$REL/bin/$bin" "/usr/local/bin/$bin"
 done
 [[ -d "$REL/dashboard" ]] && cp -r "$REL/dashboard/." /etc/falx/dashboard/
 
-# Install systemd units
-for svc in falxd.service falx-soc.service falx-ai.service; do
-    [[ -f "$SCRIPT_DIR/$svc" && ! -f "/etc/systemd/system/$svc" ]] && \
+# Install systemd units. falx-user.service MUST be installed too — falxd has
+# Requires=falx-user.service and won't start without it.
+# IMPORTANT: refresh unit files on every deploy (the `! -f` guard from the old
+# version meant operators got stuck on the first-installed unit forever).
+for svc in falx-user.service falxd.service falx-soc.service falx-ai.service; do
+    if [[ -f "$SCRIPT_DIR/$svc" ]]; then
         install -m644 "$SCRIPT_DIR/$svc" "/etc/systemd/system/$svc" && info "Installed: $svc"
+    fi
 done
 systemctl daemon-reload
 
@@ -188,6 +198,24 @@ for i in $(seq 1 10); do
         fail "Deploy failed. Logs: journalctl -u falxd -n 50"
     fi
 done
+
+# ─── 7b. Seed default policy rules (after daemon migrate()) ───────────────────
+# falxd creates the `rules` table on startup via policy.Engine.migrate(). We
+# seed the default rules AFTER the health check passes so the table is
+# guaranteed to exist. INSERT OR IGNORE in the SQL file makes re-runs a no-op.
+if [[ -f "$ROOT_DIR/configs/default_policy_rules.sql" ]]; then
+    step "Policy rules"
+    SEEDED=false
+    for attempt in 1 2 3 4 5; do
+        if sqlite3 /var/lib/falx/policy.db < "$ROOT_DIR/configs/default_policy_rules.sql" 2>/dev/null; then
+            ok "Default policy rules seeded (attempt $attempt)"
+            SEEDED=true; break
+        fi
+        sleep 1
+    done
+    $SEEDED || warn "Default policy rules NOT seeded — falxd may still be migrating. \
+Re-run manually: sudo sqlite3 /var/lib/falx/policy.db < configs/default_policy_rules.sql"
+fi
 
 # ─── 8. Cleanup ───────────────────────────────────────────────────────────────
 ls -1t /opt/falx/releases/ | tail -n +6 | while read r; do
