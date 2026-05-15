@@ -110,23 +110,19 @@ inline Frame build_frame(
     h.len     = payload_len;
 
     // CRC32 covers header[0:16] + payload
-    uint8_t hdr_bytes[HEADER_SIZE] = {};
-    std::memcpy(hdr_bytes, &h, HEADER_SIZE);
-    // Zero out CRC field before computing
-    std::memset(hdr_bytes + 16, 0, 4);
-
-    uint32_t crc = detail::crc32_compute(hdr_bytes, 16);
+    // CRC32 covers header bytes [0:16] (everything up to but not including the
+    // crc32 field itself) followed by the payload. Single-pass via
+    // vector::insert — avoids the vector::data() + offset memcpy pattern that
+    // GCC 13's -Warray-bounds occasionally flags as a false positive, and
+    // drops the intermediate hdr_bytes[20] buffer plus the double CRC compute.
+    std::vector<uint8_t> crc_input;
+    crc_input.reserve(16 + payload_len);
+    const uint8_t* hdr_p = reinterpret_cast<const uint8_t*>(&h);
+    crc_input.insert(crc_input.end(), hdr_p, hdr_p + 16);
     if (payload_len > 0) {
-        // Continue CRC over payload
-        uint32_t crc2 = 0xFFFFFFFFu;
-        // Combine: feed payload into existing CRC state
-        // For simplicity: compute over combined buffer
-        std::vector<uint8_t> combined(16 + payload_len);
-        std::memcpy(combined.data(), hdr_bytes, 16);
-        std::memcpy(combined.data() + 16, payload_data, payload_len);
-        crc = detail::crc32_compute(combined.data(), combined.size());
+        crc_input.insert(crc_input.end(), payload_data, payload_data + payload_len);
     }
-    h.crc32 = crc;
+    h.crc32 = detail::crc32_compute(crc_input.data(), crc_input.size());
 
     return frame;
 }
