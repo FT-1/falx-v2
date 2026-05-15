@@ -106,14 +106,28 @@ func (d *FalxDaemon) Run(parentCtx context.Context) error {
 	}
 	defer d.bpfMgr.Close()
 
-	// ── [2] AF_XDP Bridge ─────────────────────────────────────────────────
+	// ── [2] AF_XDP Bridge (optional zero-copy fast path) ─────────────────
+	// AF_XDP is the kernel-bypass path used to hand off packets to the AI
+	// inference engine. On virtualized NICs (VMware e1000/e1000e, virtio-net,
+	// etc.) the driver doesn't expose XDP sockets and bridge init fails with:
+	//   getsockopt XDP_MMAP_OFFSETS: operation not supported
+	// Treat init failure as a warning (not fatal) so the IPS comes up: the
+	// XDP datapath (blocklist / rate-limit / failsafe) is independent of
+	// AF_XDP and continues working without it. Downstream code that uses
+	// d.bridge must nil-check (see honeypot tracker + metrics callback).
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	d.cancelFuncs = append(d.cancelFuncs, bridgeCancel)
 
 	if err := d.initAFXDP(bridgeCtx); err != nil {
-		return fmt.Errorf("AF_XDP bridge init: %w", err)
+		d.log.Warn("AF_XDP bridge init failed — continuing without zero-copy "+
+			"fast path. Common on virtualized NICs (VMware e1000, virtio-net). "+
+			"XDP datapath remains functional; AI fast-path is disabled.",
+			zap.Error(err))
+		bridgeCancel() // release the context we won't use
+		// d.bridge stays nil; nil-guarded at every use site below.
+	} else {
+		defer d.bridge.Close()
 	}
-	defer d.bridge.Close()
 
 	// ── [3] Failsafe Engine ───────────────────────────────────────────────
 	fsCtx, fsCancel := context.WithCancel(ctx)
@@ -311,7 +325,15 @@ func (d *FalxDaemon) initHoneypot(ctx context.Context) error {
 	d.honeypotTrack = honeypot.NewTracker(d.bpfMgr, d.log)
 
 	go hpMgr.Run(ctx)
-	go d.honeypotTrack.Run(ctx, d.bridge.MetaChan())
+	// The tracker consumes packet metadata published by the AF_XDP bridge.
+	// When AF_XDP isn't running (virtual NIC fallback path), there's no
+	// meta channel to consume from — start only the manager.
+	if d.bridge != nil {
+		go d.honeypotTrack.Run(ctx, d.bridge.MetaChan())
+	} else {
+		d.log.Info("Honeypot tracker not started — AF_XDP bridge unavailable, " +
+			"no meta channel to consume from")
+	}
 
 	d.log.Info("Honeypot subsystem running")
 	return nil
@@ -320,8 +342,13 @@ func (d *FalxDaemon) initHoneypot(ctx context.Context) error {
 func (d *FalxDaemon) initMetrics(ctx context.Context) {
 	d.metricsCol = metrics.NewCollector(d.bpfMgr, d.fsEngine, d.log)
 
-	// Wire AF_XDP bridge snapshot
+	// Wire AF_XDP bridge snapshot. Returns the zero value when the bridge
+	// isn't running (virtual NIC fallback path) so Prometheus scrapes get
+	// consistent zeros rather than a nil-deref panic.
 	d.metricsCol.SetAFXDPSnapshotFn(func() metrics.AFXDPSnapshot {
+		if d.bridge == nil {
+			return metrics.AFXDPSnapshot{}
+		}
 		s := d.bridge.Snapshot()
 		return metrics.AFXDPSnapshot{
 			RxPackets:     s.RxPackets,
