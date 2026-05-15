@@ -11,6 +11,14 @@ members  = [
     "ebpf-kern",
     "ebpf-user",
 ]
+# Scope root-level `cargo build` / `cargo check` to ebpf-user only.
+# ebpf-kern is no_std + no_main and only builds for `--target bpfel-unknown-none`;
+# building it for the host triple fails with `undefined symbol: main`. The kernel
+# crate is still produced — ebpf-user/build.rs cross-compiles it during the
+# user-space build — so excluding it from default-members costs nothing.
+# To build the kernel crate explicitly:
+#     cargo build -p falx-kern --target bpfel-unknown-none -Z build-std=core
+default-members = ["ebpf-user"]
 
 # ─── Shared dependency versions (workspace-level) ────────────────────────────
 [workspace.dependencies]
