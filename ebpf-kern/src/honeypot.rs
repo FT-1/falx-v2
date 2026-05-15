@@ -33,7 +33,7 @@ use aya_ebpf::{
     programs::XdpContext,
 };
 use core::mem;
-use crate::parser::{EthHdr, Ipv4Hdr, TcpHdr, UdpHdr, ptr_at_mut};
+use crate::parser::{EthHdr, Ipv4Hdr, TcpHdr, UdpHdr, ptr_at, ptr_at_mut};
 use crate::types::{ethertype, proto};
 use crate::honeypot_maps::{HONEYPOT_TARGETS, HONEYPOT_ACTIVE};
 
@@ -163,24 +163,27 @@ fn try_redirect(ctx: &XdpContext) -> Result<u32, ()> {
 // Runs only over the IP header (max 60 bytes) — bounded, verifier-safe.
 #[inline(always)]
 fn compute_ip_checksum(ctx: &XdpContext, ip_offset: usize, ihl: usize) -> Result<u16, ()> {
-    let start = ctx.data() + ip_offset;
-    let end   = ctx.data_end();
-
-    if start + ihl > end {
-        return Err(());
-    }
-
     let mut sum: u32 = 0;
-    let hdr_ptr = start as *const u16;
 
-    // Unrolled loop over max 30 u16 words (60 bytes max IHL)
-    // BPF verifier requires bounded loops
+    // Per-word bounds check via ptr_at on every iteration.
+    //
+    // The previous form did a single outer `start + ihl > end` check and then
+    // read u16s through `hdr_ptr.add(i)`. The BPF verifier tracks packet-pointer
+    // bounds per-register-id: bounding `start + ihl` updates that DERIVED
+    // register's range but doesn't propagate back to `start` (and thus to
+    // `hdr_ptr`). Result: the verifier sees `R3 = pkt(off=14, r=0)` on the very
+    // first iteration and rejects the load with
+    //   "invalid access to packet, off=14 size=2 ... R3 offset is outside of the packet"
+    //
+    // Re-bounding each access via ptr_at gives the verifier the pointer-with-range
+    // it needs at every read. ihl is bounded to 60 by the IHL field (4 bits → 0..15,
+    // times 4 = 0..60), so the i < 30 cap is sufficient and the loop terminates.
     let words = ihl / 2;
     for i in 0..30usize {
         if i >= words { break; }
-        // Safety: bounds checked above. Read as u16 first so from_be applies
-        // to a u16 value, THEN widen to u32 for the accumulator.
-        let word: u16 = unsafe { *(hdr_ptr.add(i)) };
+        let off = ip_offset + i * 2;
+        let word_ptr: *const u16 = unsafe { ptr_at(ctx, off)? };
+        let word: u16 = unsafe { *word_ptr };
         sum += u16::from_be(word) as u32;
     }
 
