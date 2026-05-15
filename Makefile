@@ -152,11 +152,20 @@ build-user:
 	@echo "$(GREEN)[OK] User-space loader built.$(RESET)"
 
 # ─── Control Plane (Go) ──────────────────────────────────────────────────────
+# CGO_ENABLED=1 is REQUIRED — both control-plane (policy/engine.go, auth/store.go)
+# and soc-backend import github.com/mattn/go-sqlite3, which is a CGO-only driver.
+# Building with CGO=0 compiles in a stub that fails on first sql.Open() with:
+#   "Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.
+#    This is a stub"
+# falx-soc dies in ~16ms because it migrates its DBs at startup; falxd has so far
+# escaped the symptom because daemon.go's hot path doesn't open a DB, but anything
+# in daemon_p10.go (policy engine) would hit the same stub. Static-binary benefit
+# of CGO=0 isn't worth the runtime crash. Future PR could swap to modernc.org/sqlite.
 build-control-plane:
 	@echo "$(CYAN)[GO] Building control plane daemon (falxd)...$(RESET)"
 	@mkdir -p $(DIST_DIR)
 	@cd $(CP_DIR) && \
-		CGO_ENABLED=0 \
+		CGO_ENABLED=1 \
 		GOOS=linux \
 		GOARCH=amd64 \
 		$(GO) build \
@@ -181,8 +190,9 @@ build-ai:
 build-soc:
 	@echo "$(CYAN)[SOC] Building SOC backend...$(RESET)"
 	@mkdir -p $(DIST_DIR)
+	@# CGO_ENABLED=1: see comment on build-control-plane — sqlite3 driver is CGO-only.
 	@cd $(SOC_DIR) && \
-		CGO_ENABLED=0 \
+		CGO_ENABLED=1 \
 		GOOS=linux \
 		GOARCH=amd64 \
 		$(GO) build \

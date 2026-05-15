@@ -117,10 +117,37 @@ else
     CURRENT_MODE=$(grep -E '^mode[[:space:]]*='  "$FALX_CONF" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
     AVAIL_IFACES=$(ip -br link show 2>/dev/null | awk '$1 != "lo" {print $1}' | sed 's/@.*//' | tr '\n' ' ')
 
-    info "Detected interfaces: ${AVAIL_IFACES:-<none>}"
-    info "Current config:      iface=$CURRENT_IFACE  mode=$CURRENT_MODE"
-    read -rp "  Network interface for XDP attach [$CURRENT_IFACE]: " NEW_IFACE
-    NEW_IFACE=${NEW_IFACE:-$CURRENT_IFACE}
+    # Auto-detect the NIC that carries the default route, with its IPv4 address.
+    # `ip route get 8.8.8.8` resolves through the routing table even without any
+    # external connectivity (it's a kernel-only operation, no packet sent), so it
+    # works on disconnected lab VMs too.
+    AUTODETECT_IFACE=$(ip route get 8.8.8.8 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    AUTODETECT_IP=""
+    if [[ -n "$AUTODETECT_IFACE" ]]; then
+        AUTODETECT_IP=$(ip -4 -o addr show dev "$AUTODETECT_IFACE" 2>/dev/null \
+            | awk '{print $4}' | cut -d/ -f1 | head -1)
+    fi
+
+    # Prompt default precedence:
+    #   1. The interface already in falx.toml (operator's deliberate choice).
+    #   2. The auto-detected default-route interface (sensible for fresh installs).
+    #   3. Hard fallback "eth0" if neither is available.
+    # The stock falx.toml ships with iface="eth0", so treat that as "not yet set"
+    # and prefer auto-detection over the placeholder.
+    if [[ -n "$CURRENT_IFACE" && "$CURRENT_IFACE" != "eth0" ]]; then
+        DEFAULT_IFACE="$CURRENT_IFACE"
+    else
+        DEFAULT_IFACE="${AUTODETECT_IFACE:-eth0}"
+    fi
+
+    info "Available interfaces: ${AVAIL_IFACES:-<none>}"
+    if [[ -n "$AUTODETECT_IFACE" ]]; then
+        info "Default route via:    $AUTODETECT_IFACE${AUTODETECT_IP:+  (ip=$AUTODETECT_IP)}"
+    fi
+    info "Current config:       iface=$CURRENT_IFACE  mode=$CURRENT_MODE"
+    read -rp "  Network interface for XDP attach [$DEFAULT_IFACE]: " NEW_IFACE
+    NEW_IFACE=${NEW_IFACE:-$DEFAULT_IFACE}
     if ! ip link show "$NEW_IFACE" >/dev/null 2>&1; then
         warn "Interface '$NEW_IFACE' not found on this host — keeping '$CURRENT_IFACE'"
         NEW_IFACE=$CURRENT_IFACE
