@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"regexp"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -19,6 +21,20 @@ import (
 	authpkg "github.com/ft-1/falx-v2/control-plane/pkg/auth"
 	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
 	"github.com/ft-1/falx-v2/control-plane/pkg/events"
+)
+
+// falxTomlPath is where persistFailsafeThresholds writes runtime threshold
+// changes so they survive a falx-user restart (which re-reads falx.toml and
+// resets the BPF map). Hardcoded here to keep the handler signature stable;
+// could be wired through Server config in a future pass.
+const falxTomlPath = "/etc/falx/falx.toml"
+
+// reFailsafePPS / reFailsafeBPS match the top-level keys in the [failsafe]
+// section. We don't validate the section context — there's only one of each
+// key in the entire file, so anchored to-the-line-start match is sufficient.
+var (
+	reFailsafePPS = regexp.MustCompile(`(?m)^pps_threshold\s*=\s*\d+`)
+	reFailsafeBPS = regexp.MustCompile(`(?m)^bps_threshold\s*=\s*\d+`)
 )
 
 type SecurityHandler struct {
@@ -293,9 +309,45 @@ func (h *SecurityHandler) UpdateThresholds(w http.ResponseWriter, r *http.Reques
 		writeAPIError(w, http.StatusInternalServerError, "update_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+
+	// Persist to falx.toml so the values survive a falx-user restart. The BPF
+	// map alone is kernel-resident and gets overwritten when falx-user re-loads
+	// from falx.toml on the next service start. Without this, the UI says
+	// "Success" but the values silently revert on restart.
+	resp := map[string]interface{}{
 		"message":       "Failsafe thresholds updated",
 		"pps_threshold": req.PPSThreshold,
 		"bps_threshold": req.BPSThreshold,
-	})
+	}
+	if err := persistFailsafeThresholds(falxTomlPath, req.PPSThreshold, req.BPSThreshold); err != nil {
+		// Don't fail the request — the runtime BPF update succeeded, which is
+		// what the operator cares about right now. Surface the persistence
+		// failure as a warning so the UI can show it.
+		h.log.Warn("Failsafe thresholds: BPF map updated but falx.toml not persisted",
+			zap.String("path", falxTomlPath), zap.Error(err))
+		resp["warning"] = "BPF map updated. falx.toml persistence failed: " + err.Error() +
+			" — values will revert on next falx-user restart."
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// persistFailsafeThresholds rewrites the pps_threshold / bps_threshold values
+// in the [failsafe] section of falx.toml in place. Atomic via temp-file +
+// rename so a crash mid-write can't leave a half-written config.
+func persistFailsafeThresholds(path string, pps, bps uint64) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	patched := reFailsafePPS.ReplaceAllString(string(data), fmt.Sprintf("pps_threshold = %d", pps))
+	patched = reFailsafeBPS.ReplaceAllString(patched, fmt.Sprintf("bps_threshold = %d", bps))
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(patched), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename %s -> %s: %w", tmp, path, err)
+	}
+	return nil
 }
