@@ -135,7 +135,26 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Frame-Options",            "DENY")
 		h.Set("X-XSS-Protection",           "1; mode=block")
 		h.Set("Referrer-Policy",            "strict-origin-when-cross-origin")
-		h.Set("Content-Security-Policy",    "default-src 'self'")
+		// The SOC dashboard ships as a single self-contained HTML file at
+		// /etc/falx/dashboard/index.html — ~82 KB with all CSS inside one
+		// <style> block and all JS inside one <script> block. A strict
+		// `default-src 'self'` CSP blocks both, which is why the page rendered
+		// as raw unstyled HTML in the browser. 'unsafe-inline' for style-src
+		// and script-src is the minimum loosening required; img-src 'data:'
+		// permits inline base64 icons; ws:/wss: in connect-src is needed for
+		// the dashboard's WebSocket subscription to /ws. frame-ancestors 'none'
+		// is the modern equivalent of the X-Frame-Options=DENY above.
+		// Long-term option (out of scope here): per-request nonce in
+		// <style nonce=...>/<script nonce=...>, served through an html/template
+		// pipeline so the static file can drop 'unsafe-inline'.
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; "+
+				"style-src 'self' 'unsafe-inline'; "+
+				"script-src 'self' 'unsafe-inline'; "+
+				"img-src 'self' data:; "+
+				"connect-src 'self' ws: wss:; "+
+				"frame-ancestors 'none'; "+
+				"base-uri 'self'")
 		h.Set("Strict-Transport-Security",  "max-age=63072000; includeSubDomains")
 		h.Set("Cache-Control",              "no-store")
 		h.Del("Server")
