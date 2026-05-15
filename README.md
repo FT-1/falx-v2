@@ -14,22 +14,38 @@ is degraded.
 
 ---
 
+## Hands-off install
+
+For a single-command deploy on Ubuntu 22.04 / 24.04:
+
+```bash
+sudo ./scripts/deploy.sh
+```
+
+The script builds, installs, prompts for your NIC + XDP mode, patches
+`/etc/falx/falx.toml`, and starts the services with a health check (auto-rollback
+on failure). Re-run with `--rollback` to revert. For manual install, kernel
+requirements, troubleshooting, and the full architecture, keep reading.
+
+---
+
 ## Table of Contents
 
-1. [Highlights](#highlights)
-2. [Architecture](#architecture)
-3. [Quick Start](#quick-start)
-4. [Installation on Ubuntu](#installation-on-ubuntu)
-5. [Docker Deployment](#docker-deployment)
-6. [Configuration](#configuration)
-7. [REST & WebSocket API](#rest--websocket-api)
-8. [Security Model](#security-model)
-9. [Failsafe / Circuit Breaker](#failsafe--circuit-breaker)
-10. [Observability](#observability)
-11. [Troubleshooting](#troubleshooting)
-12. [Known Limitations](#known-limitations)
-13. [Project Structure](#project-structure)
-14. [Build from Source](#build-from-source)
+1. [Hands-off install](#hands-off-install)
+2. [Highlights](#highlights)
+3. [Architecture](#architecture)
+4. [Quick Start](#quick-start)
+5. [Installation on Ubuntu](#installation-on-ubuntu)
+6. [Docker Deployment](#docker-deployment)
+7. [Configuration](#configuration)
+8. [REST & WebSocket API](#rest--websocket-api)
+9. [Security Model](#security-model)
+10. [Failsafe / Circuit Breaker](#failsafe--circuit-breaker)
+11. [Observability](#observability)
+12. [Troubleshooting](#troubleshooting)
+13. [Known Limitations](#known-limitations)
+14. [Project Structure](#project-structure)
+15. [Build from Source](#build-from-source)
 
 ---
 

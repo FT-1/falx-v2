@@ -95,6 +95,50 @@ done
     sqlite3 /var/lib/falx/policy.db < "$ROOT_DIR/configs/default_policy_rules.sql" && \
     ok "Policy DB seeded"
 
+# ─── 4b. Interface & XDP mode (interactive) ───────────────────────────────────
+# Patch /etc/falx/falx.toml's iface= and mode= to match the operator's NIC.
+# Skipped when stdin is not a tty (CI / piped input) so non-interactive
+# deploys reuse whatever is in the existing falx.toml.
+step "Interface & XDP mode"
+FALX_CONF=/etc/falx/falx.toml
+if [[ ! -f "$FALX_CONF" ]]; then
+    warn "$FALX_CONF missing — interface prompt skipped (will be created on first daemon start with defaults)"
+elif [[ ! -t 0 || ! -t 1 ]]; then
+    info "Non-interactive run — leaving $FALX_CONF unchanged"
+    info "  To set iface/mode manually: edit $FALX_CONF before 'systemctl start falxd'"
+else
+    CURRENT_IFACE=$(grep -E '^iface[[:space:]]*=' "$FALX_CONF" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    CURRENT_MODE=$(grep -E '^mode[[:space:]]*='  "$FALX_CONF" | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+    AVAIL_IFACES=$(ip -br link show 2>/dev/null | awk '$1 != "lo" {print $1}' | sed 's/@.*//' | tr '\n' ' ')
+
+    info "Detected interfaces: ${AVAIL_IFACES:-<none>}"
+    info "Current config:      iface=$CURRENT_IFACE  mode=$CURRENT_MODE"
+    read -rp "  Network interface for XDP attach [$CURRENT_IFACE]: " NEW_IFACE
+    NEW_IFACE=${NEW_IFACE:-$CURRENT_IFACE}
+    if ! ip link show "$NEW_IFACE" >/dev/null 2>&1; then
+        warn "Interface '$NEW_IFACE' not found on this host — keeping '$CURRENT_IFACE'"
+        NEW_IFACE=$CURRENT_IFACE
+    fi
+
+    read -rp "  XDP mode (native/skb/offload) [$CURRENT_MODE]: " NEW_MODE
+    NEW_MODE=${NEW_MODE:-$CURRENT_MODE}
+    case "$NEW_MODE" in
+        native|skb|offload) ;;
+        *) warn "Invalid mode '$NEW_MODE' — keeping '$CURRENT_MODE'"; NEW_MODE=$CURRENT_MODE ;;
+    esac
+
+    if [[ "$NEW_IFACE" != "$CURRENT_IFACE" || "$NEW_MODE" != "$CURRENT_MODE" ]]; then
+        # sed -i.bak leaves a .bak alongside the patched file for one-step rollback.
+        sed -i.bak \
+            -e "s|^iface[[:space:]]*=[[:space:]]*\"[^\"]*\"|iface     = \"$NEW_IFACE\"|" \
+            -e "s|^mode[[:space:]]*=[[:space:]]*\"[^\"]*\"|mode = \"$NEW_MODE\"|"  \
+            "$FALX_CONF"
+        ok "Patched $FALX_CONF: iface=$NEW_IFACE  mode=$NEW_MODE  (backup: ${FALX_CONF}.bak)"
+    else
+        info "$FALX_CONF unchanged"
+    fi
+fi
+
 # ─── 5. Atomic Switchover ─────────────────────────────────────────────────────
 step "Switchover"
 PREV_REL=""

@@ -38,6 +38,12 @@ FALX_USER_BIN   := $(BUILD_DIR)/user/falx-user
 AI_BIN          := $(DIST_DIR)/falx-ai
 SOC_BIN         := $(DIST_DIR)/falx-soc
 
+# Cargo workspace target dir: ebpf-kern and ebpf-user are workspace members,
+# so cargo writes artifacts to $(ROOT_DIR)/target/ — NOT to crate-local
+# target/ subdirs. Reading from the wrong path is what caused the silent
+# "build skipped" symptoms before; sourcing from here is the authoritative path.
+CARGO_TARGET_DIR := $(ROOT_DIR)/target
+
 # Colors for terminal output
 RED             := \033[0;31m
 GREEN           := \033[0;32m
@@ -125,8 +131,8 @@ build-ebpf:
 			--target bpfel-unknown-none \
 			-Z build-std=core \
 			--release 2>&1
-	@cp $(EBPF_KERN_DIR)/target/bpfel-unknown-none/release/falx-kern \
-		$(BUILD_DIR)/ebpf/falx.bpf.o 2>/dev/null || true
+	@cp $(CARGO_TARGET_DIR)/bpfel-unknown-none/release/falx-kern \
+		$(BUILD_DIR)/ebpf/falx.bpf.o
 	@echo "$(GREEN)[OK] eBPF kernel program built.$(RESET)"
 
 # ─── eBPF User-space Loader (Rust/Aya) ───────────────────────────────────────
@@ -137,8 +143,8 @@ build-user:
 	@# active toolchain differs from what produced the cached .rmeta files.
 	@cd $(EBPF_USER_DIR) && $(CARGO) clean -q
 	@cd $(EBPF_USER_DIR) && $(CARGO) build --release
-	@cp $(EBPF_USER_DIR)/target/release/falx-user \
-		$(BUILD_DIR)/user/falx-user 2>/dev/null || true
+	@cp $(CARGO_TARGET_DIR)/release/falx-user \
+		$(BUILD_DIR)/user/falx-user
 	@echo "$(GREEN)[OK] User-space loader built.$(RESET)"
 
 # ─── Control Plane (Go) ──────────────────────────────────────────────────────
