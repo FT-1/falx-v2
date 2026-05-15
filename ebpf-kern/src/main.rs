@@ -228,7 +228,13 @@ fn check_rate_limit(src_ip: u32, cfg: &FalxMapConfig) -> Option<u32> {
         Some(bucket) => unsafe {
             // Calculate elapsed time and refill tokens
             let elapsed    = now_ns.saturating_sub((*bucket).last_refill);
-            let refill_amt = elapsed / (*bucket).refill_rate;
+            // checked_div elides the MIR-level zero-check branch that would
+            // otherwise emit a call to `panic_const_div_by_zero` — an unresolved
+            // relocation that the BPF verifier rejects. A 0 refill_rate (which
+            // the control plane should never write but the type doesn't forbid)
+            // collapses to a no-op refill, which is the semantically correct
+            // response.
+            let refill_amt = elapsed.checked_div((*bucket).refill_rate).unwrap_or(0);
 
             if refill_amt > 0 {
                 (*bucket).tokens = (*bucket).tokens
