@@ -59,19 +59,61 @@ package server
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
 	"go.uber.org/zap"
 
-	authpkg   "github.com/ft-1/falx-v2/control-plane/pkg/auth"
+	authpkg       "github.com/ft-1/falx-v2/control-plane/pkg/auth"
 	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
 	"github.com/ft-1/falx-v2/control-plane/pkg/events"
 	"github.com/ft-1/falx-v2/control-plane/pkg/notifications"
 	"github.com/ft-1/falx-v2/control-plane/pkg/policy"
 	"github.com/ft-1/falx-v2/soc-backend/internal/api"
 )
+
+// ─── Metrics Ring Buffer ──────────────────────────────────────────────────────
+// metricsRingBuffer holds the last 60 JSON-serialised metrics snapshot events.
+// New WebSocket connections are seeded with the full snapshot so charts draw
+// immediately without waiting for the next 1-second tick.
+type metricsRingBuffer struct {
+	mu   sync.RWMutex
+	buf  [60][]byte
+	head int // next write slot (0-59)
+	size int // valid entries: 0..60
+}
+
+func (rb *metricsRingBuffer) Add(data []byte) {
+	rb.mu.Lock()
+	cp := make([]byte, len(data))
+	copy(cp, data)
+	rb.buf[rb.head] = cp
+	rb.head = (rb.head + 1) % 60
+	if rb.size < 60 {
+		rb.size++
+	}
+	rb.mu.Unlock()
+}
+
+// Snapshot returns all stored frames in chronological order (oldest first).
+func (rb *metricsRingBuffer) Snapshot() [][]byte {
+	rb.mu.RLock()
+	defer rb.mu.RUnlock()
+	if rb.size == 0 {
+		return nil
+	}
+	out := make([][]byte, rb.size)
+	start := ((rb.head - rb.size) + 60) % 60
+	for i := 0; i < rb.size; i++ {
+		out[i] = rb.buf[(start+i)%60]
+	}
+	return out
+}
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 type Config struct {
@@ -85,6 +127,7 @@ type Config struct {
 	JWTPrivPath    string
 	JWTPubPath     string
 	AllowedOrigins []string
+	Dev            bool   // FALX_DEV: fixed admin TOTP + auto-unlock on every startup
 }
 
 // ─── Server ───────────────────────────────────────────────────────────────────
@@ -100,12 +143,14 @@ type Server struct {
 	bpfMgr     *bpfmaps.Manager
 	policyEng  *policy.Engine
 	eventBus   *events.Bus
-	notifMgr   *notifications.Manager
+	notifMgr       *notifications.Manager
+	dashH          *api.DashboardHandler    // held for metrics streamer goroutine
+	metricsHistory *metricsRingBuffer       // 60-second sliding window for WS seeding
 }
 
 // ─── Constructor ──────────────────────────────────────────────────────────────
 func New(cfg *Config, log *zap.Logger) (*Server, error) {
-	s := &Server{cfg: cfg, log: log}
+	s := &Server{cfg: cfg, log: log, metricsHistory: &metricsRingBuffer{}}
 	if err := s.initSubsystems(); err != nil {
 		return nil, err
 	}
@@ -144,12 +189,24 @@ func (s *Server) initSubsystems() error {
 	s.authStore  = authStore
 	s.authSvc    = authpkg.NewService(authStore, jwtMgr, s.log)
 
+	if s.cfg.Dev {
+		if err := authStore.DevModeBootstrap(); err != nil {
+			s.log.Warn("[DEV] Bootstrap failed", zap.Error(err))
+		} else {
+			s.printDevTOTP()
+		}
+	}
+
 	// BPF Maps
 	mgrCfg := bpfmaps.ManagerConfig{
 		PinPath:       s.cfg.PinPath,
 		RLConfig:      bpfmaps.DefaultRateLimitConfig(),
 		AuditLogPath:  "/var/log/falx/audit.jsonl",
 		SweepInterval: 60 * time.Second,
+		// NoCreate: the SOC backend must never create its own BPF maps.
+		// It must always open the maps pinned by falxd/falx-user so that
+		// ReadStats() reads from the live kernel map, not a fresh empty copy.
+		NoCreate:      true,
 	}
 	bpfMgr, err := bpfmaps.NewManager(mgrCfg, s.log)
 	if err != nil {
@@ -188,7 +245,8 @@ func (s *Server) buildRouter() http.Handler {
 	// ── Handlers ─────────────────────────────────────────────────────────
 	authH    := authpkg.NewHandler(s.authSvc, s.log)
 	secH     := api.NewSecurityHandler(s.bpfMgr, s.eventBus, s.log)
-	dashH    := api.NewDashboardHandler(s.bpfMgr, s.policyEng, s.eventBus, s.log)
+	s.dashH   = api.NewDashboardHandler(s.bpfMgr, s.policyEng, s.eventBus, s.log)
+	dashH    := s.dashH
 	notifH   := api.NewNotificationsHandler(s.notifMgr, s.log)
 	adminH   := api.NewAdminHandler(s.authSvc, s.authStore, s.log)
 	policyH  := policy.NewHandler(s.policyEng, s.log)
@@ -204,13 +262,25 @@ func (s *Server) buildRouter() http.Handler {
 	// and their permissions is internal information that must not be public.
 	// OWASP API3:2023 Broken Object Property Level Authorization.
 
-	// ── Authenticated: all roles ──────────────────────────────────────────
+	// ── Auth-only routes (RequireAuth, NO TFA check) ─────────────────────
+	// These routes are accessible with a tfa_ok=false token so that a user
+	// who just registered (and has never set up TOTP) can complete enrollment
+	// without being blocked by RequireTFAVerified.
+	authOnly := r.PathPrefix("/api/v1").Subrouter()
+	authOnly.Use(auth.RequireAuth)
+
+	authOnly.HandleFunc("/auth/logout",       authH.Logout).Methods(http.MethodPost)
+	authOnly.HandleFunc("/auth/logout-all",   authH.LogoutAll).Methods(http.MethodPost)
+	authOnly.HandleFunc("/auth/me",           authH.Me).Methods(http.MethodGet)
+	authOnly.HandleFunc("/auth/totp/begin",   authH.TOTPBegin).Methods(http.MethodPost)
+	authOnly.HandleFunc("/auth/totp/confirm", authH.TOTPConfirm).Methods(http.MethodPost)
+
+	// ── Authenticated + TFA verified: all remaining routes ────────────────
 	authed := r.PathPrefix("/api/v1").Subrouter()
 	authed.Use(auth.RequireAuth)
+	authed.Use(auth.RequireTFAVerified)
+	authed.Use(auth.RequireScope(authpkg.ScopeSession))
 
-	authed.HandleFunc("/auth/logout",        authH.Logout).Methods(http.MethodPost)
-	authed.HandleFunc("/auth/logout-all",    authH.LogoutAll).Methods(http.MethodPost)
-	authed.HandleFunc("/auth/me",            authH.Me).Methods(http.MethodGet)
 	authed.HandleFunc("/auth/me/password",   authH.ChangePassword).Methods(http.MethodPut)
 	// SEC-FIX-001: /roles requires authentication (viewer+)
 	authed.HandleFunc("/auth/roles",         authH.ListRoles).Methods(http.MethodGet)
@@ -275,20 +345,22 @@ func (s *Server) buildRouter() http.Handler {
 	authed.Handle("/users/{id}",         adminPerm(http.HandlerFunc(authH.GetUser))).Methods(http.MethodGet)
 	authed.Handle("/users/{id}/lock",    adminWrite(http.HandlerFunc(authH.LockUser))).Methods(http.MethodPut)
 	authed.Handle("/users/{id}/unlock",  adminWrite(http.HandlerFunc(authH.UnlockUser))).Methods(http.MethodPut)
+	authed.Handle("/users/{id}/totp",    superPerm(http.HandlerFunc(authH.TOTPDisable))).Methods(http.MethodDelete)
 	authed.Handle("/audit",              auth.RequirePermission(authpkg.PermAuditRead)(http.HandlerFunc(authH.GetAuditLog))).Methods(http.MethodGet)
 	authed.Handle("/system/config",      superPerm(http.HandlerFunc(systemH.GetConfig))).Methods(http.MethodGet)
 	authed.Handle("/system/config",      superPerm(http.HandlerFunc(systemH.UpdateConfig))).Methods(http.MethodPut)
 	authed.Handle("/system/metrics-summary", adminPerm(http.HandlerFunc(systemH.MetricsSummary))).Methods(http.MethodGet)
 
-	// ── WebSocket — viewer+ ───────────────────────────────────────────────
-	r.Handle("/ws", auth.RequireAuth(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+	// ── WebSocket — viewer+ (requires full TFA) ───────────────────────────
+	r.Handle("/ws", auth.RequireAuth(auth.RequireTFAVerified(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		claims := authpkg.ClaimsFromContext(req.Context())
 		if claims == nil {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		s.notifMgr.Hub().HandleUpgrade(w, req, claims.UserID, string(claims.Role))
-	})))
+		seed := s.metricsHistory.Snapshot()
+		s.notifMgr.Hub().HandleUpgrade(w, req, claims.UserID, string(claims.Role), seed)
+	}))))
 
 	// ── Observability (no auth) ───────────────────────────────────────────
 	r.HandleFunc("/healthz",  systemH.Liveness).Methods(http.MethodGet)
@@ -303,6 +375,7 @@ func (s *Server) buildRouter() http.Handler {
 // ─── Run / Shutdown ───────────────────────────────────────────────────────────
 func (s *Server) Run(ctx context.Context) error {
 	go s.notifMgr.Run(ctx)
+	go s.runMetricsStreamer(ctx)
 
 	s.log.Info("HTTP server listening", zap.String("addr", s.cfg.HTTPAddr))
 	errCh := make(chan error, 1)
@@ -329,6 +402,160 @@ func (s *Server) Reload() {
 		s.policyEng.Reload()
 	}
 	s.log.Info("Configuration reloaded")
+}
+
+// runMetricsStreamer samples BPF counters every second, computes per-second
+// rates (delta / elapsed), updates the dashboard handler's rate cache, and
+// publishes a metrics.stats.snapshot event to the WebSocket hub so connected
+// clients receive live PPS/chart data without waiting for a manual poll.
+//
+// If falx-soc started before falxd has pinned its maps (s.bpfMgr == nil), the
+// streamer polls every 2 seconds until the maps appear, then attaches and starts
+// streaming without requiring a restart.
+func (s *Server) runMetricsStreamer(ctx context.Context) {
+	if s.dashH == nil {
+		return
+	}
+
+	// Wait for BPF maps to be available (late-attach when falxd starts after us)
+	mgr := s.bpfMgr
+	if mgr == nil {
+		s.log.Info("Metrics streamer: BPF maps not ready, polling until falxd pins them")
+		retryTicker := time.NewTicker(2 * time.Second)
+		defer retryTicker.Stop()
+	waitLoop:
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-retryTicker.C:
+				mgrCfg := bpfmaps.ManagerConfig{
+					PinPath:       s.cfg.PinPath,
+					RLConfig:      bpfmaps.DefaultRateLimitConfig(),
+					AuditLogPath:  "/var/log/falx/audit.jsonl",
+					SweepInterval: 60 * time.Second,
+					NoCreate:      true,
+				}
+				newMgr, err := bpfmaps.NewManager(mgrCfg, s.log)
+				if err != nil {
+					continue
+				}
+				mgr = newMgr
+				s.bpfMgr = mgr
+				s.dashH.SetBPFMgr(mgr)
+				s.log.Info("Metrics streamer: BPF maps attached (late-attach)")
+				break waitLoop
+			}
+		}
+	}
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	var (
+		prevStats bpfmaps.XdpStats
+		prevAt    time.Time
+		first     = true
+	)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			stats, err := mgr.ReadStats()
+			if err != nil {
+				s.log.Warn("Metrics streamer: BPF read failed", zap.Error(err))
+				continue
+			}
+
+			if first {
+				prevStats = stats
+				prevAt    = now
+				first     = false
+				continue
+			}
+
+			elapsed := now.Sub(prevAt).Seconds()
+			if elapsed <= 0 {
+				elapsed = 1
+			}
+
+			pps        := float64(stats.RxPackets-prevStats.RxPackets)   / elapsed
+			dropPPS    := float64(stats.Dropped-prevStats.Dropped)        / elapsed
+			passPPS    := float64(stats.Passed-prevStats.Passed)          / elapsed
+			limitedPPS := float64(stats.RateLimited-prevStats.RateLimited)/ elapsed
+			rxBytesDelta := stats.RxBytes - prevStats.RxBytes
+			mbps        := float64(rxBytesDelta) * 8 / 1_000_000 / elapsed
+
+			// DEBUG: log every 5 seconds so the log doesn't flood but stays readable.
+			// Remove once confirmed non-zero values flow to the frontend.
+			if int(now.Unix())%5 == 0 {
+				s.log.Info("[DEBUG_STATS] BPF counters",
+					zap.Uint64("rx_packets",   stats.RxPackets),
+					zap.Uint64("passed",       stats.Passed),
+					zap.Uint64("dropped",      stats.Dropped),
+					zap.Uint64("rate_limited", stats.RateLimited),
+					zap.Float64("pps",         pps),
+					zap.Float64("pass_pps",    passPPS),
+					zap.Float64("drop_pps",    dropPPS),
+					zap.Float64("mbps",        mbps),
+				)
+			}
+
+			// Clamp negatives (counter reset on daemon restart)
+			if pps < 0        { pps = 0 }
+			if dropPPS < 0    { dropPPS = 0 }
+			if passPPS < 0    { passPPS = 0 }
+			if limitedPPS < 0 { limitedPPS = 0 }
+			if mbps < 0       { mbps = 0 }
+
+			rates := api.MetricsRates{
+				PPS:        pps,
+				DropPPS:    dropPPS,
+				PassPPS:    passPPS,
+				LimitedPPS: limitedPPS,
+				MBps:       mbps,
+				SampledAt:  now.UTC(),
+			}
+			s.dashH.UpdateRates(rates)
+
+			// Publish to WebSocket clients and store in 60-second ring buffer.
+			ev := events.MetricsSnapshotEvent(pps, dropPPS, passPPS, limitedPPS, mbps)
+			s.eventBus.Publish(ev)
+			if frame, err := json.Marshal(ev); err == nil {
+				s.metricsHistory.Add(frame)
+			}
+
+			prevStats = stats
+			prevAt    = now
+		}
+	}
+}
+
+// printDevTOTP computes the current TOTP code for the fixed dev admin secret and
+// prints a visible banner to stderr so developers can copy it straight from the
+// terminal after every restart — no external authenticator app needed.
+func (s *Server) printDevTOTP() {
+	code, err := authpkg.GenerateTOTP(authpkg.DevTOTPSecret, time.Now())
+	if err != nil {
+		s.log.Warn("[DEV] Failed to compute TOTP code", zap.Error(err))
+		return
+	}
+	remaining := 30 - (time.Now().Unix() % 30)
+	fmt.Fprintf(os.Stderr,
+		"\n╔══════════════════════════════════════════════════╗\n"+
+			"║  [DEV] Admin 2FA Token : %-6s                  ║\n"+
+			"║  Valid for next        : %2d seconds             ║\n"+
+			"║  Secret                : %-28s  ║\n"+
+			"╚══════════════════════════════════════════════════╝\n\n",
+		code, remaining, authpkg.DevTOTPSecret,
+	)
+	s.log.Warn("[DEV] Admin 2FA Token",
+		zap.String("code", code),
+		zap.Int64("valid_for_seconds", remaining),
+		zap.String("secret", authpkg.DevTOTPSecret),
+	)
 }
 
 // serveDashboard serves the embedded SOC dashboard HTML for all unmatched paths.

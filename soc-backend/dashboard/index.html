@@ -289,6 +289,85 @@ tr:hover td{background:rgba(255,255,255,.02)}
   </div>
 </div>
 
+<!-- ── 2FA Setup Wizard ──────────────────────────────────────────────────── -->
+<div id="totp-wizard" style="display:none;position:fixed;inset:0;z-index:9999;
+     background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center">
+  <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;
+              padding:32px;max-width:480px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.6)">
+
+    <!-- Step 1: Scan / enter secret -->
+    <div id="totp-step1">
+      <div style="font-size:22px;font-weight:700;color:var(--accent);margin-bottom:4px">
+        ⚡ إعداد المصادقة الثنائية
+      </div>
+      <div style="color:var(--text3);font-size:13px;margin-bottom:20px">
+        يجب إعداد المصادقة الثنائية (2FA) قبل الوصول إلى لوحة التحكم.
+      </div>
+
+      <div style="background:var(--bg3);border-radius:8px;padding:16px;margin-bottom:16px">
+        <div style="font-size:12px;color:var(--text3);margin-bottom:6px">الخطوة 1 — افتح تطبيق المصادقة (Google Authenticator / Authy)</div>
+        <div style="font-size:12px;color:var(--text3);margin-bottom:12px">الخطوة 2 — امسح رمز QR بالكاميرا:</div>
+
+        <!-- QR code — served as SVG data URI from the Go backend -->
+        <div style="display:flex;justify-content:center;margin-bottom:14px">
+          <img id="totp-qr" width="200" height="200" alt="TOTP QR Code"
+               style="border-radius:8px;background:#fff;display:block;
+                      box-shadow:0 0 0 6px #fff,0 0 0 8px var(--border)">
+        </div>
+
+        <div style="font-size:12px;color:var(--text3);margin-bottom:6px">أو افتح الرابط مباشرة:</div>
+
+        <a id="totp-uri-link" href="#" target="_blank" style="
+           display:block;background:var(--bg1);border:1px solid var(--border);
+           border-radius:6px;padding:10px;font-size:11px;color:var(--accent);
+           word-break:break-all;text-decoration:none;margin-bottom:10px">
+          جاري التحميل...
+        </a>
+
+        <div style="font-size:12px;color:var(--text3);margin-bottom:4px">أو أدخل المفتاح يدوياً:</div>
+        <div id="totp-secret-display" style="
+             font-family:monospace;font-size:15px;letter-spacing:2px;
+             color:var(--green);background:var(--bg1);border:1px solid var(--border);
+             border-radius:6px;padding:10px;word-break:break-all">
+          جاري التحميل...
+        </div>
+      </div>
+
+      <div style="font-size:12px;color:var(--text3);margin-bottom:6px">الخطوة 3 — أدخل الرمز المكوّن من 6 أرقام للتأكيد:</div>
+      <input type="text" id="totp-confirm-code" maxlength="6" inputmode="numeric"
+             placeholder="000000"
+             style="width:100%;box-sizing:border-box;font-size:22px;text-align:center;
+                    letter-spacing:8px;padding:12px;border-radius:8px;
+                    background:var(--bg1);border:1px solid var(--border);
+                    color:var(--text1);margin-bottom:12px">
+      <div id="totp-step1-err" style="color:var(--red);font-size:13px;
+           min-height:20px;margin-bottom:10px"></div>
+      <button class="btn-primary" style="width:100%" onclick="totpConfirmStep()">
+        تفعيل 2FA
+      </button>
+    </div>
+
+    <!-- Step 2: Show backup codes -->
+    <div id="totp-step2" style="display:none">
+      <div style="font-size:22px;font-weight:700;color:var(--green);margin-bottom:4px">
+        ✓ تم تفعيل 2FA
+      </div>
+      <div style="color:var(--text3);font-size:13px;margin-bottom:16px">
+        احتفظ بهذه الرموز الاحتياطية في مكان آمن. لن تُعرض مرة أخرى.
+      </div>
+      <div id="totp-backup-codes" style="
+           font-family:monospace;font-size:13px;background:var(--bg1);
+           border:1px solid var(--border);border-radius:8px;padding:16px;
+           display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:16px">
+      </div>
+      <button class="btn-primary" style="width:100%" onclick="totpWizardDone()">
+        حفظت الرموز — ادخل إلى لوحة التحكم
+      </button>
+    </div>
+
+  </div>
+</div>
+
 <!-- ── Main App ───────────────────────────────────────────────────────────── -->
 <div id="app" style="display:none">
 
@@ -856,9 +935,19 @@ async function doLogin() {
     }
     TOKEN = data.tokens.access_token;
     USER  = data.user;
-    localStorage.setItem('falx_token', TOKEN);
-    localStorage.setItem('falx_user',  JSON.stringify(USER));
-    initApp();
+    // 2FA is mandatory ONLY for the admin tier (admin / super_admin). For those
+    // roles, if TOTP isn't set up yet, hold the token in memory only and force
+    // the enrollment wizard — do NOT write to localStorage first (a page refresh
+    // would otherwise bypass 2FA with a tfa_ok=false token). Lower-privilege
+    // roles log in with username+password alone and go straight to the dashboard.
+    const requires2FA = (USER.role === 'admin' || USER.role === 'super_admin');
+    if (requires2FA && !USER.totp_enabled) {
+      showTOTPWizard();
+    } else {
+      localStorage.setItem('falx_token', TOKEN);
+      localStorage.setItem('falx_user',  JSON.stringify(USER));
+      initApp();
+    }
   } catch(e) {
     err.textContent = 'خطأ في الاتصال بالخادم'; err.style.display = 'block';
   } finally {
@@ -922,6 +1011,86 @@ function initApp() {
   loadNotifications();
 }
 
+// ── 2FA Setup Wizard ─────────────────────────────────────────────────────
+async function showTOTPWizard() {
+  document.getElementById('login-screen').style.display = 'none';
+  const wizard = document.getElementById('totp-wizard');
+  wizard.style.display = 'flex';
+
+  // Fetch enrollment data from backend
+  const r = await fetch('/api/v1/auth/totp/begin', {
+    method: 'POST', headers: authHeaders(),
+  });
+  if (!r.ok) {
+    document.getElementById('totp-step1-err').textContent =
+      'فشل تحميل بيانات الإعداد — حاول تسجيل الدخول مرة أخرى';
+    return;
+  }
+  const d = await r.json();
+
+  // Show the provisioning URI as a tappable link (opens authenticator on mobile)
+  const link = document.getElementById('totp-uri-link');
+  link.href        = d.provisioning_uri;
+  link.textContent = d.provisioning_uri;
+
+  // Show the base32 secret in groups of 4 for readability
+  document.getElementById('totp-secret-display').textContent =
+    (d.secret.match(/.{1,4}/g) || []).join(' ');
+
+  // Render QR code from backend-supplied SVG data URI
+  const qrImg = document.getElementById('totp-qr');
+  if (qrImg && d.qr_data_uri) {
+    qrImg.src = d.qr_data_uri;
+  }
+
+  // Store backup codes for step 2
+  wizard._backupCodes = d.backup_codes || [];
+}
+
+async function totpConfirmStep() {
+  const code = document.getElementById('totp-confirm-code').value.trim();
+  const errEl = document.getElementById('totp-step1-err');
+  errEl.textContent = '';
+  if (code.length !== 6 || !/^\d+$/.test(code)) {
+    errEl.textContent = 'أدخل رمزاً مكوّناً من 6 أرقام';
+    return;
+  }
+  const r = await fetch('/api/v1/auth/totp/confirm', {
+    method: 'POST', headers: authHeaders(),
+    body: JSON.stringify({code}),
+  });
+  const d = await r.json();
+  if (!r.ok) {
+    errEl.textContent = d.message || 'رمز غير صحيح — تحقق من الوقت في تطبيق المصادقة';
+    return;
+  }
+  // Replace the pending tfa_ok=false token with the upgraded tfa_ok=true token
+  // returned by the server. Only NOW is it safe to persist to localStorage.
+  if (d.tokens && d.tokens.access_token) {
+    TOKEN = d.tokens.access_token;
+  }
+  USER.totp_enabled = true;
+  localStorage.setItem('falx_token', TOKEN);
+  localStorage.setItem('falx_user',  JSON.stringify(USER));
+
+  // Move to step 2: display backup codes
+  document.getElementById('totp-step1').style.display = 'none';
+  document.getElementById('totp-step2').style.display  = 'block';
+  const wizard = document.getElementById('totp-wizard');
+  const codes  = d.backup_codes || wizard._backupCodes || [];
+  document.getElementById('totp-backup-codes').innerHTML =
+    codes.map(c => `<div style="background:var(--bg2);padding:6px 8px;border-radius:4px;
+                    font-size:12px;color:var(--text1)">${escHtml(c)}</div>`).join('');
+}
+
+function totpWizardDone() {
+  document.getElementById('totp-wizard').style.display = 'none';
+  document.getElementById('totp-step1').style.display  = 'block';
+  document.getElementById('totp-step2').style.display  = 'none';
+  document.getElementById('totp-confirm-code').value   = '';
+  initApp();
+}
+
 // ── WebSocket ────────────────────────────────────────────────────────────
 function connectWebSocket() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -953,6 +1122,19 @@ function scheduleWSReconnect() {
 }
 
 function handleWSEvent(ev) {
+  // Metrics snapshots are high-frequency (1/sec) — update PPS displays directly
+  // without touching the live feed or notification badge.
+  if (ev.topic === 'metrics.stats.snapshot') {
+    const m = ev.meta || {};
+    applyMetricsRates({
+      pps:         parseFloat(m.pps         || 0),
+      drop_pps:    parseFloat(m.drop_pps    || 0),
+      pass_pps:    parseFloat(m.pass_pps    || 0),
+      limited_pps: parseFloat(m.limited_pps || 0),
+      mbps:        parseFloat(m.mbps        || 0),
+    });
+    return;
+  }
   addLiveFeedEvent(ev);
   updateCircuitFromEvent(ev);
   bumpNotifBadge();
@@ -970,17 +1152,37 @@ async function loadStats() {
     const r = await api('/api/v1/dashboard/stats');
     if (!r || !r.ok) return;
     const d = await r.json();
+    // Cumulative totals for the summary KPIs
     fmtStat('kpi-rx',   d.rx_packets);
     fmtStat('kpi-drop', d.dropped + (d.rate_limited||0));
     fmtStat('kpi-rate', d.rate_limited);
     fmtStat('kpi-pass', d.passed);
-    // rates
     el('redirect-count').textContent = fmtNum(d.redirected||0);
 
     const dropPct = d.drop_percentage || 0;
     el('drop-pct').textContent = dropPct.toFixed(1) + '%';
     el('drop-bar').style.width = Math.min(dropPct, 100) + '%';
+
+    // Per-second rates from the rolling 1 s window computed server-side
+    applyMetricsRates(d);
   } catch(_){}
+}
+
+// applyMetricsRates updates all PPS/throughput displays from a rates object.
+// Called by both loadStats() (polling) and handleWSEvent() (WebSocket push).
+function applyMetricsRates(d) {
+  const pps = d.pps ?? 0;
+  el('current-pps').textContent = fmtNum(Math.round(pps));
+  // pps-bar relative to failsafe threshold if available (filled by loadFailsafe)
+  const thr = parseInt(el('fs-threshold').textContent.replace(/[^0-9]/g,'')) || 0;
+  if (thr > 0) {
+    el('pps-bar').style.width = Math.min((pps / thr) * 100, 100) + '%';
+  }
+  // Failsafe page live PPS counters
+  if (d.pps !== undefined) {
+    el('fs-pps').textContent     = fmtNum(Math.round(pps));
+    el('fs-cur-pps').textContent = fmtNum(Math.round(pps));
+  }
 }
 
 async function loadFailsafe() {
@@ -1009,10 +1211,14 @@ async function loadFailsafe() {
     el('btn-close-circuit').style.display = open ? '' : 'none';
 
     // Stats
-    el('fs-pps').textContent = el('fs-cur-pps').textContent = fmtNum(d.current_pps||0);
+    // fs-pps / fs-cur-pps are kept live by applyMetricsRates() (WS + polling).
+    // Only update the threshold display and bar here — the PPS value itself
+    // comes from the rolling 1 s window, not the BPF cumulative current_pps.
     el('fs-threshold').textContent = fmtNum(d.pps_threshold||0);
-    el('fs-pps-bar').style.width = d.pps_threshold
-      ? Math.min((d.current_pps/d.pps_threshold)*100, 100) + '%' : '0%';
+    if (d.pps_threshold) {
+      const curPPS = parseInt(el('fs-pps').textContent.replace(/[^0-9]/g,'')) || 0;
+      el('fs-pps-bar').style.width = Math.min((curPPS / d.pps_threshold) * 100, 100) + '%';
+    }
 
     const badge2 = el('fs-status-badge');
     badge2.textContent = open ? 'مفتوحة ⚠' : 'مغلقة ✓';
@@ -1147,8 +1353,12 @@ async function updateThresholds() {
   const bps = parseInt(el('thr-bps').value);
   if (!pps || !bps) { toast('أدخل قيماً صحيحة', 'error'); return; }
   const r = await api('/api/v1/failsafe/thresholds', 'PUT', {pps_threshold: pps, bps_threshold: bps});
-  if (r && r.ok) toast('تم تحديث العتبات', 'success');
-  else toast('فشل التحديث', 'error');
+  if (r && r.ok) {
+    toast('تم تحديث العتبات', 'success');
+    loadFailsafe(); // Immediately refresh displayed thresholds without waiting for the 5s poll
+  } else {
+    toast('فشل التحديث', 'error');
+  }
 }
 
 // ── Policy ───────────────────────────────────────────────────────────────
@@ -1547,7 +1757,14 @@ window.addEventListener('load', () => {
   if (saved && user) {
     TOKEN = saved;
     try { USER = JSON.parse(user); } catch(_){}
-    if (USER) { initApp(); return; }
+    if (USER) {
+      // Belt-and-suspenders: a token in localStorage should always have
+      // totp_enabled=true (we only persist after wizard confirmation), but
+      // guard anyway in case of a stale pre-fix token in an existing session.
+      if (!USER.totp_enabled) { showTOTPWizard(); return; }
+      initApp();
+      return;
+    }
   }
   document.getElementById('login-screen').style.display = 'flex';
 });
@@ -1558,6 +1775,230 @@ document.addEventListener('click', e => {
   if (panel && !panel.contains(e.target) && !e.target.closest('button[onclick*="toggleNotifPanel"]'))
     panel.classList.remove('show');
 });
+</script>
+
+<!-- ═══════════════════════════════════════════════════════════════════════
+     Inline QR Code Engine — zero external dependencies.
+     Implements ISO 18004 byte mode, EC level M, versions 1-10.
+     Exports: window.renderQRToCanvas(text, canvasEl, {dark, light, margin})
+     ═══════════════════════════════════════════════════════════════════════ -->
+<script>
+(function(W){'use strict';
+
+// ── GF(256) tables for Reed-Solomon ─────────────────────────────────────────
+const EXP=new Uint8Array(512),LOG=new Uint8Array(256);
+(function(){let x=1;for(let i=0;i<255;i++){EXP[i]=x;LOG[x]=i;x=(x<<1)^(x>=128?0x11d:0);}for(let i=255;i<512;i++)EXP[i]=EXP[i-255];})();
+const gm=(a,b)=>a&&b?EXP[LOG[a]+LOG[b]]:0;
+
+function rsEncode(data,n){
+  let g=[1];
+  for(let i=0;i<n;i++){const t=new Array(g.length+1).fill(0);for(let j=0;j<g.length;j++){t[j]^=g[j];t[j+1]^=gm(g[j],EXP[i]);}g=t;}
+  const msg=[...data,...new Array(n).fill(0)];
+  for(let i=0;i<data.length;i++){const c=msg[i];if(c)for(let j=1;j<=n;j++)msg[i+j]^=gm(c,g[j]);}
+  return msg.slice(data.length);
+}
+
+// ── Version table (EC level M): [dataBytes, ecPerBlock, [g1n,g1sz], [g2n,g2sz]?]
+const VT=[
+  [16, 10,[1,16]],         // v1
+  [28, 16,[1,28]],         // v2
+  [44, 26,[1,44]],         // v3
+  [64, 18,[2,32]],         // v4
+  [86, 24,[2,43]],         // v5
+  [108,16,[4,27]],         // v6
+  [124,18,[4,31]],         // v7
+  [154,22,[2,38],[2,39]],  // v8
+  [182,22,[3,36],[2,37]],  // v9
+  [216,26,[4,43],[1,44]],  // v10
+];
+
+// ── Alignment pattern center coordinates per version
+const AP=[[],[6,18],[6,22],[6,26],[6,30],[6,34],[6,22,38],[6,24,42],[6,26,46],[6,28,50]];
+
+// ── Format info 15-bit words for EC=M, masks 0-7 (precomputed, verified)
+const FI=[0x5412,0x5125,0x5E7C,0x5B4B,0x45F9,0x40CE,0x4F97,0x4AA0];
+
+// ── Remainder bits appended after data codeword bits, per version
+const RB=[0,7,7,7,7,7,0,0,0,0];
+
+// ── Encode text to QR codewords ──────────────────────────────────────────────
+function encode(text){
+  // UTF-8 bytes
+  const bytes=[];
+  for(let i=0;i<text.length;i++){
+    const c=text.charCodeAt(i);
+    if(c<0x80)bytes.push(c);
+    else if(c<0x800)bytes.push(0xC0|(c>>6),0x80|(c&0x3F));
+    else bytes.push(0xE0|(c>>12),0x80|((c>>6)&0x3F),0x80|(c&0x3F));
+  }
+  const vi=VT.findIndex(v=>v[0]>=bytes.length);
+  if(vi<0)throw new Error('QR: text exceeds v10 capacity');
+  const [totalData,ecPerBlock,g1,g2]=VT[vi];
+  const ver=vi+1;
+
+  // Bit stream
+  const bits=[];
+  const push=(v,n)=>{for(let i=n-1;i>=0;i--)bits.push((v>>i)&1);};
+  push(0b0100,4);
+  push(bytes.length,ver<=9?8:16);
+  bytes.forEach(b=>push(b,8));
+  const cap=totalData*8;
+  for(let i=0;i<Math.min(4,cap-bits.length);i++)bits.push(0);
+  while(bits.length%8)bits.push(0);
+  const pads=[0xEC,0x11];
+  while(bits.length<cap)push(pads[(bits.length>>3)&1],8);
+
+  const data=Array.from({length:totalData},(_,i)=>{let b=0;for(let j=0;j<8;j++)b=(b<<1)|bits[i*8+j];return b;});
+
+  // Reed-Solomon blocks
+  const blocks=[];let pos=0;
+  for(const [cnt,sz] of [g1,g2].filter(Boolean)){
+    for(let i=0;i<cnt;i++){const bl=data.slice(pos,pos+sz);blocks.push({d:bl,ec:rsEncode(bl,ecPerBlock)});pos+=sz;}
+  }
+
+  // Interleave
+  const maxD=Math.max(...blocks.map(b=>b.d.length)),out=[];
+  for(let i=0;i<maxD;i++)blocks.forEach(b=>{if(i<b.d.length)out.push(b.d[i]);});
+  for(let i=0;i<ecPerBlock;i++)blocks.forEach(b=>out.push(b.ec[i]));
+  return{ver,cw:out};
+}
+
+// ── Build module matrix ───────────────────────────────────────────────────────
+function buildMatrix(ver,cw){
+  const N=ver*4+17;
+  const mod=Array.from({length:N},()=>new Array(N).fill(null));
+  const fn =Array.from({length:N},()=>new Uint8Array(N));
+  const put=(r,c,v,f)=>{if(r<0||r>=N||c<0||c>=N)return;mod[r][c]=v;if(f)fn[r][c]=1;};
+
+  // Finder patterns (with 1-cell separator)
+  const finder=(tr,tc)=>{
+    for(let r=-1;r<=7;r++)for(let c=-1;c<=7;c++){
+      put(tr+r,tc+c,r<0||r>6||c<0||c>6?0:r===0||r===6||c===0||c===6?1:r>=2&&r<=4&&c>=2&&c<=4?1:0,true);
+    }
+  };
+  finder(0,0);finder(0,N-7);finder(N-7,0);
+
+  // Timing strips
+  for(let i=0;i<N;i++){put(6,i,i%2?0:1,true);put(i,6,i%2?0:1,true);}
+
+  // Dark module
+  put(N-8,8,1,true);
+
+  // Alignment patterns
+  const ap=AP[ver-1];
+  for(const r of ap)for(const c of ap){
+    if(fn[r][c])continue;
+    for(let dr=-2;dr<=2;dr++)for(let dc=-2;dc<=2;dc++)
+      put(r+dr,c+dc,dr===0&&dc===0||Math.abs(dr)===2||Math.abs(dc)===2?1:0,true);
+  }
+
+  // Format info placeholder cells (marked functional, values written post-masking)
+  [[8,0],[8,1],[8,2],[8,3],[8,4],[8,5],[8,7],[8,8],[7,8],[5,8],[4,8],[3,8],[2,8],[1,8],[0,8],
+   [N-1,8],[N-2,8],[N-3,8],[N-4,8],[N-5,8],[N-6,8],[N-7,8],
+   [8,N-7],[8,N-6],[8,N-5],[8,N-4],[8,N-3],[8,N-2],[8,N-1]]
+  .forEach(([r,c])=>put(r,c,0,true));
+
+  // Data bits (zigzag scan)
+  const bits=[];
+  cw.forEach(b=>{for(let i=7;i>=0;i--)bits.push((b>>i)&1);});
+  for(let i=0;i<RB[ver-1];i++)bits.push(0);
+  let bi=0,up=true;
+  for(let right=N-1;right>=1;right-=2){
+    if(right===6)right=5;
+    for(let row=0;row<N;row++){
+      const r=up?N-1-row:row;
+      for(let dc=0;dc<2;dc++){const c=right-dc;if(!fn[r][c])mod[r][c]=bi<bits.length?bits[bi++]:0;}
+    }
+    up=!up;
+  }
+  return{mod,fn,N};
+}
+
+// ── Apply mask pattern ────────────────────────────────────────────────────────
+const MASKS=[
+  (r,c)=>(r+c)%2===0,
+  (r,c)=>r%2===0,
+  (r,c)=>c%3===0,
+  (r,c)=>(r+c)%3===0,
+  (r,c)=>(Math.floor(r/2)+Math.floor(c/3))%2===0,
+  (r,c)=>r*c%2+(r*c)%3===0,
+  (r,c)=>(r*c%2+r*c%3)%2===0,
+  (r,c)=>((r+c)%2+r*c%3)%2===0,
+];
+function applyMask(mod,fn,N,m){
+  return mod.map((row,r)=>row.map((v,c)=>fn[r][c]?v:v^(MASKS[m](r,c)?1:0)));
+}
+
+// ── Write format info into masked matrix ──────────────────────────────────────
+function writeFormat(mod,N,m){
+  const bits=FI[m];
+  const C1=[[8,0],[8,1],[8,2],[8,3],[8,4],[8,5],[8,7],[8,8],[7,8],[5,8],[4,8],[3,8],[2,8],[1,8],[0,8]];
+  const C2=[[N-1,8],[N-2,8],[N-3,8],[N-4,8],[N-5,8],[N-6,8],[N-7,8],[N-8,8],[8,N-7],[8,N-6],[8,N-5],[8,N-4],[8,N-3],[8,N-2],[8,N-1]];
+  for(let i=0;i<15;i++){
+    const v=(bits>>i)&1;
+    mod[C1[i][0]][C1[i][1]]=v;
+    mod[C2[i][0]][C2[i][1]]=i===7?1:v; // position 7 in C2 = dark module, always 1
+  }
+}
+
+// ── Penalty score (all 4 rules) ───────────────────────────────────────────────
+const P3A=[1,0,1,1,1,0,1,0,0,0,0],P3B=[0,0,0,0,1,0,1,1,1,0,1];
+function penalty(mod,N){
+  let s=0;
+  // Rule 1: runs of 5+ same-color
+  for(let r=0;r<N;r++){let run=1;for(let c=1;c<N;c++){run=mod[r][c]===mod[r][c-1]?run+1:1;if(run===5)s+=3;else if(run>5)s++;}}
+  for(let c=0;c<N;c++){let run=1;for(let r=1;r<N;r++){run=mod[r][c]===mod[r-1][c]?run+1:1;if(run===5)s+=3;else if(run>5)s++;}}
+  // Rule 2: 2×2 same-color blocks
+  for(let r=0;r<N-1;r++)for(let c=0;c<N-1;c++){const v=mod[r][c];if(v===mod[r+1][c]&&v===mod[r][c+1]&&v===mod[r+1][c+1])s+=3;}
+  // Rule 3: finder-like patterns
+  for(let r=0;r<N;r++)for(let c=0;c<=N-11;c++){
+    let mA=true,mB=true;
+    for(let k=0;k<11;k++){if(mod[r][c+k]!==P3A[k])mA=false;if(mod[r][c+k]!==P3B[k])mB=false;}
+    if(mA||mB)s+=40;
+  }
+  for(let c=0;c<N;c++)for(let r=0;r<=N-11;r++){
+    let mA=true,mB=true;
+    for(let k=0;k<11;k++){if(mod[r+k][c]!==P3A[k])mA=false;if(mod[r+k][c]!==P3B[k])mB=false;}
+    if(mA||mB)s+=40;
+  }
+  // Rule 4: dark module ratio deviation
+  let dark=0;mod.forEach(row=>row.forEach(v=>{if(v)dark++;}));
+  const pct=dark*100/(N*N),lo=Math.floor(pct/5)*5,hi=Math.ceil(pct/5)*5;
+  s+=Math.min(Math.abs(lo-50),Math.abs(hi-50))/5*10;
+  return s;
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+W.renderQRToCanvas=function(text,canvas,opts){
+  const{dark='#000',light='#fff',margin=2}=opts||{};
+  let ver,cw;
+  try{({ver,cw}=encode(text));}
+  catch(e){console.error(e);return;}
+
+  const{mod:base,fn,N}=buildMatrix(ver,cw);
+
+  // Try all 8 masks, keep best-scoring
+  let best=null,bestScore=Infinity;
+  for(let m=0;m<8;m++){
+    const masked=applyMask(base,fn,N,m);
+    writeFormat(masked,N,m);
+    const sc=penalty(masked,N);
+    if(sc<bestScore){bestScore=sc;best=masked;}
+  }
+
+  // Render to canvas
+  const total=N+margin*2;
+  const cell=Math.max(1,Math.floor(canvas.width/total));
+  canvas.width=cell*total;
+  canvas.height=cell*total;
+  const ctx=canvas.getContext('2d');
+  ctx.fillStyle=light;ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.fillStyle=dark;
+  for(let r=0;r<N;r++)for(let c=0;c<N;c++)
+    if(best[r][c])ctx.fillRect((c+margin)*cell,(r+margin)*cell,cell,cell);
+};
+
+})(window);
 </script>
 </body>
 </html>

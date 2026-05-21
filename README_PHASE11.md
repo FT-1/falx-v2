@@ -135,7 +135,7 @@ ws.onmessage = e => handleEvent(JSON.parse(e.data))
   "severity": "warning",
   "title": "IP Address Blocked",
   "message": "IP 185.220.101.45 blocked by soc:admin",
-  "timestamp": "2024-01-15T14:30:00Z",
+  "timestamp": "2026-01-15T14:30:00Z",
   "meta": { "src_ip": "185.220.101.45", "ttl_s": "3600" }
 }
 ```

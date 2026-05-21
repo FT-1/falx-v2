@@ -27,6 +27,18 @@ import (
 	"go.uber.org/zap"
 )
 
+// ─── TOTP Enrollment State ────────────────────────────────────────────────────
+// pendingTOTP holds a generated TOTP secret while the operator scans the QR
+// code and submits the first valid confirmation code. Entries expire after
+// 10 minutes to prevent stale enrollments accumulating in memory.
+// backupHashes are NOT stored here — they are computed at confirm-time to
+// avoid blocking BeginTOTPSetup on 8× Argon2id rounds.
+type pendingTOTPEntry struct {
+	secret     string
+	plainCodes []string // hashed and persisted on confirm; shown once to user
+	expiresAt  time.Time
+}
+
 // ─── Service ──────────────────────────────────────────────────────────────────
 type Service struct {
 	store   *Store
@@ -36,6 +48,10 @@ type Service struct {
 	// Login rate limiter: IP → token bucket
 	loginRLMu sync.Mutex
 	loginRL   map[string]*loginRateLimiter
+
+	// Pending TOTP enrollments: userID → entry (expires 10 min after begin)
+	pendingTOTPMu sync.Mutex
+	pendingTOTP   map[string]*pendingTOTPEntry
 }
 
 type loginRateLimiter struct {
@@ -48,11 +64,79 @@ const loginRateWindow   = time.Minute
 
 func NewService(store *Store, jwt *JWTManager, log *zap.Logger) *Service {
 	return &Service{
-		store:   store,
-		jwt:     jwt,
-		log:     log,
-		loginRL: make(map[string]*loginRateLimiter),
+		store:       store,
+		jwt:         jwt,
+		log:         log,
+		loginRL:     make(map[string]*loginRateLimiter),
+		pendingTOTP: make(map[string]*pendingTOTPEntry),
 	}
+}
+
+// ─── TOTP Enrollment ──────────────────────────────────────────────────────────
+
+// BeginTOTPSetup generates a new TOTP secret for the user and stashes it in
+// memory until ConfirmTOTPSetup is called. Returns the enrollment details
+// (provisioning URI, base32 secret, plaintext backup codes) for the wizard.
+func (s *Service) BeginTOTPSetup(userID string) (*TOTPEnrollment, error) {
+	user, err := s.store.GetUserByID(userID)
+	if err != nil {
+		return nil, ErrUserNotFound
+	}
+
+	enroll, err := BeginTOTPEnrollment(user.Username, string(user.Role))
+	if err != nil {
+		return nil, fmt.Errorf("generate TOTP enrollment: %w", err)
+	}
+
+	s.pendingTOTPMu.Lock()
+	s.pendingTOTP[userID] = &pendingTOTPEntry{
+		secret:     enroll.Secret,
+		plainCodes: enroll.BackupCodes,
+		expiresAt:  time.Now().Add(10 * time.Minute),
+	}
+	s.pendingTOTPMu.Unlock()
+
+	return enroll, nil
+}
+
+// ConfirmTOTPSetup verifies that the operator can produce a valid TOTP code
+// from the pending secret, then atomically enables 2FA on their account.
+// Returns the plaintext backup codes for one-time display.
+func (s *Service) ConfirmTOTPSetup(userID, code string) ([]string, error) {
+	s.pendingTOTPMu.Lock()
+	entry, ok := s.pendingTOTP[userID]
+	if !ok || time.Now().After(entry.expiresAt) {
+		delete(s.pendingTOTP, userID)
+		s.pendingTOTPMu.Unlock()
+		return nil, fmt.Errorf("no pending TOTP enrollment — call /auth/totp/begin first")
+	}
+	secret     := entry.secret
+	plainCodes := entry.plainCodes
+	s.pendingTOTPMu.Unlock()
+
+	if !VerifyTOTPCode(secret, code) {
+		return nil, fmt.Errorf("invalid TOTP code — check your authenticator app clock")
+	}
+
+	// Hash backup codes now (deferred from begin-time to avoid blocking the
+	// wizard open on 8× Argon2id rounds — acceptable latency at confirm-time).
+	backupHashes, err := HashBackupCodes(plainCodes)
+	if err != nil {
+		return nil, fmt.Errorf("hash backup codes: %w", err)
+	}
+
+	if err := s.store.UpdateTOTPSecret(userID, secret, true); err != nil {
+		return nil, fmt.Errorf("save TOTP secret: %w", err)
+	}
+	if err := s.store.UpdateBackupCodes(userID, backupHashes); err != nil {
+		s.log.Warn("TOTP enabled but backup codes not persisted", zap.Error(err))
+	}
+
+	s.pendingTOTPMu.Lock()
+	delete(s.pendingTOTP, userID)
+	s.pendingTOTPMu.Unlock()
+
+	return plainCodes, nil
 }
 
 // ─── Login ────────────────────────────────────────────────────────────────────
@@ -90,14 +174,19 @@ func (s *Service) Login(req LoginRequest, ipAddr, userAgent string) (*LoginRespo
 		return nil, ErrInvalidCredentials
 	}
 
-	// Verify TOTP if enabled
+	// 2FA policy: enforced ONLY for the admin tier (admin, super_admin).
+	// Lower-privilege roles authenticate with username+password alone.
+	enforce2FA := user.Role.Requires2FA()
+
+	// Verify TOTP whenever the account has it enabled (even for a non-admin who
+	// opted in). For admins it is effectively mandatory via the scope gate below.
 	if user.TOTPEnabled {
 		if req.TOTPCode == "" {
-			return nil, fmt.Errorf("2FA code required")
+			return nil, ErrTOTPRequired
 		}
 		if !verifyTOTP(user.TOTPSecret, req.TOTPCode) {
 			s.auditLogin(user.ID, user.Username, ipAddr, userAgent, false, "invalid_totp")
-			return nil, fmt.Errorf("invalid 2FA code")
+			return nil, ErrInvalidCredentials
 		}
 	}
 
@@ -121,8 +210,17 @@ func (s *Service) Login(req LoginRequest, ipAddr, userAgent string) (*LoginRespo
 		return nil, fmt.Errorf("create session: %w", err)
 	}
 
-	// Generate access token
-	accessToken, expiry, err := s.jwt.GenerateAccessToken(user, session.ID)
+	// Generate access token.
+	//   - Admin tier without TOTP yet → pre-auth scope forces enrollment first.
+	//   - Admin tier with TOTP → verified above → full session scope.
+	//   - Non-admin roles → 2FA not required → full session scope immediately,
+	//     and TFA is considered satisfied so RequireTFAVerified does not block them.
+	tfaVerified := user.TOTPEnabled || !enforce2FA
+	scope := ScopeSession
+	if enforce2FA && !user.TOTPEnabled {
+		scope = ScopePreAuth
+	}
+	accessToken, expiry, err := s.jwt.GenerateAccessToken(user, session.ID, tfaVerified, scope)
 	if err != nil {
 		return nil, fmt.Errorf("generate access token: %w", err)
 	}
@@ -207,8 +305,16 @@ func (s *Service) RefreshTokens(
 		return nil, fmt.Errorf("create rotated session: %w", err)
 	}
 
-	// Generate new access token
-	accessToken, expiry, err := s.jwt.GenerateAccessToken(user, session.ID)
+	// Generate new access token. Preserve the same TFA/scope policy as login:
+	// 2FA is enforced only for the admin tier. Non-admin roles keep full session
+	// scope with TFA considered satisfied (password-only accounts).
+	enforce2FA := user.Role.Requires2FA()
+	tfaOK := user.TOTPEnabled || !enforce2FA
+	refreshScope := ScopeSession
+	if enforce2FA && !user.TOTPEnabled {
+		refreshScope = ScopePreAuth
+	}
+	accessToken, expiry, err := s.jwt.GenerateAccessToken(user, session.ID, tfaOK, refreshScope)
 	if err != nil {
 		return nil, err
 	}
@@ -357,6 +463,49 @@ func (s *Service) ValidateRequest(tokenStr string) (*TokenClaims, error) {
 	s.store.TouchSession(claims.SessionID) //nolint:errcheck
 
 	return claims, nil
+}
+
+// ─── IssueUpgradedToken ───────────────────────────────────────────────────────
+// IssueUpgradedToken reissues an access token with tfa_ok=true and scope=session
+// for the given user+session. Called by TOTPConfirm after the first valid code
+// confirms enrollment, so the frontend can transition to the dashboard without
+// a full re-login.
+func (s *Service) IssueUpgradedToken(userID, sessionID string) (*TokenPair, error) {
+	user, err := s.store.GetUserByID(userID)
+	if err != nil {
+		return nil, err
+	}
+	accessToken, expiry, err := s.jwt.GenerateAccessToken(user, sessionID, true, ScopeSession)
+	if err != nil {
+		return nil, fmt.Errorf("issue upgraded token: %w", err)
+	}
+	return &TokenPair{
+		AccessToken: accessToken,
+		TokenType:   "Bearer",
+		ExpiresIn:   int64(s.jwt.AccessTokenTTL().Seconds()),
+		ExpiresAt:   expiry,
+	}, nil
+}
+
+// ─── DisableTOTPSetup ─────────────────────────────────────────────────────────
+// DisableTOTPSetup clears TOTP for targetUserID and revokes all their sessions.
+// Intended for super_admin use during debugging or account recovery.
+func (s *Service) DisableTOTPSetup(targetUserID, actorUserID, actorIP string) error {
+	if _, err := s.store.GetUserByID(targetUserID); err != nil {
+		return ErrUserNotFound
+	}
+	if err := s.store.DisableTOTP(targetUserID); err != nil {
+		return fmt.Errorf("disable TOTP: %w", err)
+	}
+	s.store.RevokeAllUserSessions(targetUserID) //nolint:errcheck
+	s.store.WriteAuditEvent(AuthAuditEvent{
+		UserID:    actorUserID,
+		Action:    "totp_disable",
+		Resource:  targetUserID,
+		IPAddress: actorIP,
+		Success:   true,
+	})
+	return nil
 }
 
 // ─── Login Rate Limiter ───────────────────────────────────────────────────────

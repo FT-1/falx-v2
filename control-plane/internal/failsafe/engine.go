@@ -27,6 +27,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,6 +37,75 @@ import (
 	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
 	"github.com/ft-1/falx-v2/control-plane/pkg/events"
 )
+
+// ─── Admin Override Latch ─────────────────────────────────────────────────────
+// adminOverrideCooldown is how long algorithmic tripping is suppressed after a
+// manual ForceClose. Long enough to outlast a sustained flood's cumulative-drop
+// ratio (which stays near 100% for the duration of the attack).
+const (
+	adminOverrideCooldown  = 5 * time.Minute
+	adminOverrideLatchPath = "/run/falx/admin_override"
+)
+
+// adminOverrideLatch suppresses automatic circuit tripping for a fixed window
+// after a SOC operator forces the circuit closed. Both in-process (via
+// overrideCh) and cross-process (via sentinel file from falx-soc) paths arm it.
+type adminOverrideLatch struct {
+	mu     sync.Mutex
+	active bool
+	until  time.Time
+}
+
+func (l *adminOverrideLatch) Arm(d time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.active = true
+	l.until  = time.Now().Add(d)
+}
+
+func (l *adminOverrideLatch) Clear() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.active = false
+	l.until  = time.Time{}
+}
+
+func (l *adminOverrideLatch) IsActive() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.active {
+		return false
+	}
+	if time.Now().After(l.until) {
+		l.active = false
+		return false
+	}
+	return true
+}
+
+func (l *adminOverrideLatch) ExpiresAt() time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.until
+}
+
+// adminOverrideFileActive checks whether the cross-process sentinel file exists
+// and was written within the adminOverrideCooldown window. falx-soc touches this
+// file when ForceCloseCircuit is called so that the engine (running in falxd)
+// suppresses algorithmic re-tripping even across the process boundary.
+func adminOverrideFileActive() bool {
+	fi, err := os.Stat(adminOverrideLatchPath)
+	if err != nil {
+		return false
+	}
+	return time.Since(fi.ModTime()) < adminOverrideCooldown
+}
+
+func touchAdminOverrideFile() {
+	dir := "/run/falx"
+	_ = os.MkdirAll(dir, 0o755)
+	_ = os.WriteFile(adminOverrideLatchPath, []byte("1"), 0o644)
+}
 
 // ErrEngineBusy is returned by ForceOpen/ForceClose/UpdateThresholds when the
 // engine's override channel is full — the engine goroutine is stalled and the
@@ -82,6 +152,10 @@ type Engine struct {
 
 	// Manual override channel (SOC operator can force open/close)
 	overrideCh chan overrideCmd
+
+	// Admin override latch: suppresses algorithmic tripping after ForceClose.
+	// Checked on every tickClosed() call.
+	adminLatch adminOverrideLatch
 
 	// Track last-closed time for backoff reset
 	lastClosedAt time.Time
@@ -234,6 +308,17 @@ func (e *Engine) tick() {
 
 // ─── CLOSED: Normal operation — run detectors ─────────────────────────────────
 func (e *Engine) tickClosed(stats bpfmaps.XdpStats) {
+	// Admin override latch: a SOC operator manually closed the circuit.
+	// Suppress algorithmic re-tripping for the cooldown window (5 min) so
+	// that cumulative drop-ratio > 90% (always high during an ongoing attack)
+	// does not instantly re-open the circuit after the operator's action.
+	// Keep feeding stats to the detector so the EMA baseline stays fresh.
+	if e.adminLatch.IsActive() || adminOverrideFileActive() {
+		e.detector.Analyze(stats)
+		e.cb.ResetViolation()
+		return
+	}
+
 	results := e.detector.Analyze(stats)
 
 	// Check backoff reset eligibility
@@ -430,6 +515,8 @@ func (e *Engine) applyOverride(cmd overrideCmd) {
 
 	case overrideForceOpen:
 		e.log.Warn("SOC manual circuit OPEN", zap.String("reason", cmd.reason))
+		e.adminLatch.Clear()
+		_ = os.Remove(adminOverrideLatchPath) // clear cross-process sentinel
 		if e.cb.Trip(cmd.reason, 0, 0) {
 			e.publishTransition(StateClosed, StateOpen, cmd.reason, 0)
 		}
@@ -440,6 +527,8 @@ func (e *Engine) applyOverride(cmd overrideCmd) {
 
 	case overrideForceClose:
 		e.log.Warn("SOC manual circuit CLOSE", zap.String("reason", cmd.reason))
+		e.adminLatch.Arm(adminOverrideCooldown)
+		touchAdminOverrideFile() // arm cross-process sentinel for falx-soc path
 		if e.cb.Close(0, 0) {
 			e.publishTransition(StateOpen, StateClosed, cmd.reason, 0)
 		}
@@ -486,20 +575,24 @@ func (e *Engine) syncStateFromKernel() {
 
 // ─── Metrics ──────────────────────────────────────────────────────────────────
 type EngineMetrics struct {
-	Circuit       CircuitSnapshot
-	Baseline      DetectorBaseline
-	TotalTrips    uint64
-	TotalCloses   uint64
-	PollInterval  time.Duration
+	Circuit              CircuitSnapshot
+	Baseline             DetectorBaseline
+	TotalTrips           uint64
+	TotalCloses          uint64
+	PollInterval         time.Duration
+	AdminOverrideActive  bool
+	AdminOverrideExpires time.Time
 }
 
 func (e *Engine) Metrics() EngineMetrics {
 	return EngineMetrics{
-		Circuit:      e.cb.Snapshot(),
-		Baseline:     e.detector.Baseline(),
-		TotalTrips:   e.totalTrips.Load(),
-		TotalCloses:  e.totalCloses.Load(),
-		PollInterval: e.cfg.PollInterval,
+		Circuit:              e.cb.Snapshot(),
+		Baseline:             e.detector.Baseline(),
+		TotalTrips:           e.totalTrips.Load(),
+		TotalCloses:          e.totalCloses.Load(),
+		PollInterval:         e.cfg.PollInterval,
+		AdminOverrideActive:  e.adminLatch.IsActive() || adminOverrideFileActive(),
+		AdminOverrideExpires: e.adminLatch.ExpiresAt(),
 	}
 }
 

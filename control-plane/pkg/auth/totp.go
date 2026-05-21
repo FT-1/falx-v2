@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -145,67 +146,97 @@ func hotp(key []byte, counter uint64, digits int) (uint32, error) {
 
 // ─── Provisioning URI ─────────────────────────────────────────────────────────
 // GenerateProvisioningURI creates an otpauth:// URI for QR code generation.
-// Scan with any authenticator app.
+// Uses net/url so label components and parameter values are correctly
+// percent-encoded per RFC 3986 — prevents any character in the username or
+// issuer from breaking the URI structure.
 func GenerateProvisioningURI(secret, username string) string {
-	return fmt.Sprintf(
-		"otpauth://totp/%s:%s?secret=%s&issuer=%s&algorithm=SHA1&digits=%d&period=%d",
-		totpIssuer, username, secret, totpIssuer, totpDigits, totpPeriod,
-	)
+	// Label: "Issuer:Account" — each component percent-encoded independently
+	// so the colon separator is preserved as a literal.
+	label := url.PathEscape(totpIssuer) + ":" + url.PathEscape(username)
+
+	params := url.Values{}
+	params.Set("secret", secret)
+	params.Set("issuer", totpIssuer)
+	params.Set("algorithm", "SHA1")
+	params.Set("digits", fmt.Sprintf("%d", totpDigits))
+	params.Set("period", fmt.Sprintf("%d", totpPeriod))
+
+	return "otpauth://totp/" + label + "?" + params.Encode()
 }
 
 // ─── Backup Codes ─────────────────────────────────────────────────────────────
 const backupCodeCount = 8
 
-// GenerateBackupCodes creates 8 single-use backup codes.
-// Returns (plaintext codes for display, hashed codes for storage).
-func GenerateBackupCodes() ([]string, []string, error) {
-	plain  := make([]string, backupCodeCount)
-	hashed := make([]string, backupCodeCount)
-
+// GenerateBackupCodes creates 8 random plaintext backup codes.
+// Hashing is intentionally NOT done here — call HashBackupCodes at confirm
+// time so the wizard opens instantly instead of blocking for 8× Argon2id.
+func GenerateBackupCodes() ([]string, error) {
+	plain   := make([]string, backupCodeCount)
 	charset := "ABCDEFGHJKLMNPQRSTUVWXYZ23456789" // No O/0/1/I ambiguity
 	for i := range plain {
 		b := make([]byte, 8)
 		if _, err := rand.Read(b); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		code := make([]byte, 8)
 		for j, v := range b {
 			code[j] = charset[v%byte(len(charset))]
 		}
 		plain[i] = fmt.Sprintf("%s-%s", string(code[:4]), string(code[4:]))
+	}
+	return plain, nil
+}
 
-		h, err := HashPassword(plain[i])
+// HashBackupCodes Argon2id-hashes plaintext backup codes for storage.
+// Called at confirm-time (after the user scans the QR code), not at begin-time.
+// Uses HashBackupCode — NOT HashPassword — to avoid user-password length policy.
+func HashBackupCodes(plain []string) ([]string, error) {
+	hashed := make([]string, len(plain))
+	for i, code := range plain {
+		h, err := HashBackupCode(code)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		hashed[i] = h
 	}
-	return plain, hashed, nil
+	return hashed, nil
 }
 
 // ─── TOTP Enrollment ──────────────────────────────────────────────────────────
 type TOTPEnrollment struct {
-	Secret         string   `json:"secret"`
-	ProvisioningURI string  `json:"provisioning_uri"`
-	BackupCodes    []string `json:"backup_codes"` // Show once, never again
+	Secret          string   `json:"secret"`
+	ProvisioningURI string   `json:"provisioning_uri"`
+	BackupCodes     []string `json:"backup_codes"` // Show once, never again
+	QRDataURI       string   `json:"qr_data_uri"`  // data:image/svg+xml;base64,…
+	// Identity context — returned to the wizard so the UI can confirm which
+	// account and role are being secured before the user scans the QR code.
+	Username        string   `json:"username"`
+	Role            string   `json:"role"`
 }
 
 // BeginTOTPEnrollment starts the TOTP setup for a user.
-// The user must confirm a valid code before TOTP is activated.
-func BeginTOTPEnrollment(username string) (*TOTPEnrollment, []string, error) {
+// role is the user's current RBAC role string (e.g. "super_admin") — included
+// in the enrollment response for wizard context display only, NOT in the URI.
+// Returns enrollment data only — backup codes are NOT hashed here.
+// Call HashBackupCodes on the returned BackupCodes at confirm-time.
+func BeginTOTPEnrollment(username, role string) (*TOTPEnrollment, error) {
 	secret, err := GenerateTOTPSecret()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	plain, hashed, err := GenerateBackupCodes()
+	plain, err := GenerateBackupCodes()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
+	uri := GenerateProvisioningURI(secret, username)
 	return &TOTPEnrollment{
 		Secret:          secret,
-		ProvisioningURI: GenerateProvisioningURI(secret, username),
+		ProvisioningURI: uri,
 		BackupCodes:     plain,
-	}, hashed, nil
+		QRDataURI:       qrDataURI(uri),
+		Username:        username,
+		Role:            role,
+	}, nil
 }

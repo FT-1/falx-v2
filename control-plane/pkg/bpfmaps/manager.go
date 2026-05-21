@@ -16,8 +16,12 @@
 package bpfmaps
 
 import (
+	"bufio"
 	"fmt"
 	"net"
+	"os"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -26,16 +30,18 @@ import (
 
 // ─── Manager ──────────────────────────────────────────────────────────────────
 type Manager struct {
-	pinPath string
-	rl      *MapRateLimiter
-	audit   *AuditLogger
-	log     *zap.Logger
+	pinPath  string
+	noCreate bool // when true, only open existing pinned maps — never create
+	rl       *MapRateLimiter
+	audit    *AuditLogger
+	log      *zap.Logger
 
 	// Cached map handles (opened once at startup, reused)
 	blocklistV4   *ebpf.Map
 	blocklistV6   *ebpf.Map
 	rateLimitMap  *ebpf.Map
-	xdpStats      *ebpf.Map
+	xdpStats      *ebpf.Map // cold-path: rate_limited, failsafe_drops, redirected, parse_errors …
+	mappedStats   *ebpf.Map // hot-path: rx_packets, rx_bytes, passed, dropped (bump_mapped)
 	failsafeState *ebpf.Map
 	configMap     *ebpf.Map
 	xskMap        *ebpf.Map
@@ -47,6 +53,11 @@ type ManagerConfig struct {
 	RLConfig      RateLimitConfig
 	AuditLogPath  string
 	SweepInterval time.Duration
+	// NoCreate instructs the manager to attach to maps that already exist on
+	// the BPF filesystem without ever creating new ones. Use this in the SOC
+	// backend so it always reads from the live kernel maps pinned by falxd,
+	// not from a fresh empty copy it accidentally races to create at startup.
+	NoCreate      bool
 }
 
 // ─── Constructor ──────────────────────────────────────────────────────────────
@@ -59,10 +70,11 @@ func NewManager(cfg ManagerConfig, log *zap.Logger) (*Manager, error) {
 	}
 
 	m := &Manager{
-		pinPath: cfg.PinPath,
-		rl:      rl,
-		audit:   audit,
-		log:     log,
+		pinPath:  cfg.PinPath,
+		noCreate: cfg.NoCreate,
+		rl:       rl,
+		audit:    audit,
+		log:      log,
 	}
 
 	if err := m.openMaps(); err != nil {
@@ -76,31 +88,179 @@ func NewManager(cfg ManagerConfig, log *zap.Logger) (*Manager, error) {
 	return m, nil
 }
 
-// openMaps loads all pinned BPF maps from the filesystem.
-func (m *Manager) openMaps() error {
-	type mapEntry struct {
-		name   string
-		target **ebpf.Map
+// falxMapSpecs defines the BPF map parameters for programmatic creation when
+// the ebpf-user loader has not yet run (e.g. first boot, container cold-start).
+// Sizes MUST match the ABI verified in types.go init().
+var falxMapSpecs = map[string]*ebpf.MapSpec{
+	"blocklist_v4":      {Type: ebpf.LRUHash,     KeySize: 4,  ValueSize: 16, MaxEntries: 65536},
+	"blocklist_v6":      {Type: ebpf.LRUHash,     KeySize: 16, ValueSize: 16, MaxEntries: 65536},
+	"rate_limit":        {Type: ebpf.LRUHash,     KeySize: 4,  ValueSize: 40, MaxEntries: 65536},
+	"xdp_stats":         {Type: ebpf.PerCPUArray, KeySize: 4,  ValueSize: 96, MaxEntries: 1},
+	// hot-path compact per-CPU accumulator — 6×u64 = 48 bytes (one cache line)
+	"mapped_xdp_stats":  {Type: ebpf.PerCPUArray, KeySize: 4,  ValueSize: 48, MaxEntries: 1},
+	"failsafe_state":    {Type: ebpf.Array,        KeySize: 4,  ValueSize: 56, MaxEntries: 1},
+	"config":            {Type: ebpf.Array,        KeySize: 4,  ValueSize: 32, MaxEntries: 1},
+	"xsk_map":           {Type: ebpf.XSKMap,       KeySize: 4,  ValueSize: 4,  MaxEntries: 64},
+}
+
+// ensureBPFMount checks /proc/mounts and mounts bpffs at /sys/fs/bpf if absent.
+func ensureBPFMount() error {
+	f, err := os.Open("/proc/mounts")
+	if err != nil {
+		return fmt.Errorf("cannot read /proc/mounts: %w", err)
 	}
-	entries := []mapEntry{
-		{"blocklist_v4",    &m.blocklistV4},
-		{"blocklist_v6",    &m.blocklistV6},
-		{"rate_limit",      &m.rateLimitMap},
-		{"xdp_stats",       &m.xdpStats},
-		{"failsafe_state",  &m.failsafeState},
-		{"config",          &m.configMap},
-		{"xsk_map",         &m.xskMap},
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) >= 3 && fields[1] == "/sys/fs/bpf" && fields[2] == "bpf" {
+			return nil // already mounted
+		}
 	}
 
-	for _, e := range entries {
-		pinFile := m.pinPath + "/" + e.name
-		mp, err := ebpf.LoadPinnedMap(pinFile, &ebpf.LoadPinOptions{})
-		if err != nil {
-			return fmt.Errorf("cannot open pinned map %q: %w", pinFile, err)
-		}
-		*e.target = mp
-		m.log.Debug("Opened pinned map", zap.String("map", e.name))
+	if err := os.MkdirAll("/sys/fs/bpf", 0o755); err != nil {
+		return fmt.Errorf("mkdir /sys/fs/bpf: %w", err)
 	}
+	if err := syscall.Mount("bpffs", "/sys/fs/bpf", "bpf", 0, ""); err != nil {
+		return fmt.Errorf("mount bpffs: %w", err)
+	}
+	return nil
+}
+
+// openOrCreatePinnedMap tries to load a pinned map; if the pin does not exist
+// it creates the map from the falxMapSpecs table and pins it.
+func (m *Manager) openOrCreatePinnedMap(name string, target **ebpf.Map) error {
+	pinFile := m.pinPath + "/" + name
+
+	mp, err := ebpf.LoadPinnedMap(pinFile, &ebpf.LoadPinOptions{})
+	if err == nil {
+		*target = mp
+		m.log.Debug("Opened existing pinned map", zap.String("map", name))
+		return nil
+	}
+
+	spec, ok := falxMapSpecs[name]
+	if !ok {
+		return fmt.Errorf("no map spec defined for %q and pin not found", name)
+	}
+
+	mp, err = ebpf.NewMap(spec)
+	if err != nil {
+		return fmt.Errorf("create BPF map %q: %w", name, err)
+	}
+	if err := mp.Pin(pinFile); err != nil {
+		mp.Close()
+		return fmt.Errorf("pin BPF map %q to %s: %w", name, pinFile, err)
+	}
+
+	*target = mp
+	m.log.Info("Created and pinned new BPF map",
+		zap.String("map", name), zap.String("pin", pinFile))
+	return nil
+}
+
+// initDefaultMapValues writes safe defaults into newly-created Array maps.
+// It is a no-op if the maps already carry non-zero state (real kernel values).
+func (m *Manager) initDefaultMapValues() {
+	var key uint32 = 0
+
+	var state FailsafeState
+	if err := m.failsafeState.Lookup(&key, &state); err != nil || state.PPSThreshold == 0 {
+		defaultState := FailsafeState{
+			PPSThreshold: 500_000,           // 500 kpps default trip threshold
+			BPSThreshold: 10_000_000_000,    // 10 Gbps default
+		}
+		if err := m.failsafeState.Update(&key, &defaultState, ebpf.UpdateAny); err != nil {
+			m.log.Warn("initDefaultMapValues: failsafe_state write failed", zap.Error(err))
+		}
+	}
+
+	var cfg FalxMapConfig
+	if err := m.configMap.Lookup(&key, &cfg); err != nil || cfg.DefaultAction == 0 {
+		defaultCfg := FalxMapConfig{
+			DefaultAction:    ActionPass,
+			RateLimitEnabled: 1,
+			FailsafeEnabled:  1,
+		}
+		if err := m.configMap.Update(&key, &defaultCfg, ebpf.UpdateAny); err != nil {
+			m.log.Warn("initDefaultMapValues: config write failed", zap.Error(err))
+		}
+	}
+}
+
+// openExistingPinnedMap loads a map that MUST already be pinned by falxd.
+// Returns a clear error if the pin is absent — the SOC backend must never
+// silently create a shadow map that diverges from the kernel-live data.
+func (m *Manager) openExistingPinnedMap(name string, target **ebpf.Map, optional bool) error {
+	pinFile := m.pinPath + "/" + name
+	mp, err := ebpf.LoadPinnedMap(pinFile, &ebpf.LoadPinOptions{})
+	if err != nil {
+		if optional {
+			m.log.Debug("Optional BPF map not present — skipping",
+				zap.String("map", name), zap.String("pin", pinFile))
+			return nil
+		}
+		return fmt.Errorf(
+			"BPF map %q not found at %s — is falxd running and have maps been loaded? (%w)",
+			name, pinFile, err,
+		)
+	}
+	*target = mp
+	m.log.Debug("Attached to existing pinned BPF map",
+		zap.String("map", name), zap.String("pin", pinFile))
+	return nil
+}
+
+// openMaps ensures bpffs is mounted, the pin directory exists, then opens or
+// creates each map. Self-heals on a clean node before the kernel loader runs.
+func (m *Manager) openMaps() error {
+	if err := ensureBPFMount(); err != nil {
+		// Non-fatal: bpffs may already be mounted but /proc/mounts unreadable
+		// in a restricted container environment.
+		m.log.Warn("BPF filesystem mount check failed — continuing", zap.Error(err))
+	}
+
+	type mapEntry struct {
+		name     string
+		target   **ebpf.Map
+		optional bool // in NoCreate mode: missing pin is a warning, not a fatal error
+	}
+	entries := []mapEntry{
+		{"blocklist_v4",     &m.blocklistV4,   false},
+		{"blocklist_v6",     &m.blocklistV6,   false},
+		{"rate_limit",       &m.rateLimitMap,  false},
+		{"xdp_stats",        &m.xdpStats,      false},
+		// hot-path per-CPU counters: rx_packets, rx_bytes, passed, dropped
+		// written by bump_mapped() — must be opened to get live packet counts
+		{"mapped_xdp_stats", &m.mappedStats,   false},
+		{"failsafe_state",   &m.failsafeState, false},
+		{"config",           &m.configMap,     false},
+		// xsk_map is optional: AF_XDP bridge is non-fatal if never pinned
+		{"xsk_map",          &m.xskMap,        true},
+	}
+
+	if m.noCreate {
+		// SOC backend path: open existing maps only, never create.
+		// No mkdir — the pin directory must already exist (created by falxd).
+		for _, e := range entries {
+			if err := m.openExistingPinnedMap(e.name, e.target, e.optional); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// falxd path: create-if-missing (self-heal before kernel loader runs).
+	if err := os.MkdirAll(m.pinPath, 0o755); err != nil {
+		return fmt.Errorf("create BPF pin directory %s: %w", m.pinPath, err)
+	}
+	for _, e := range entries {
+		if err := m.openOrCreatePinnedMap(e.name, e.target); err != nil {
+			return err
+		}
+	}
+	m.initDefaultMapValues()
 	return nil
 }
 
@@ -235,22 +395,57 @@ func (m *Manager) UnblockIPv6(ip net.IP, actor string) error {
 
 // ─── Stats ────────────────────────────────────────────────────────────────────
 
-// ReadStats aggregates XdpStats across all CPUs.
+// ReadStats merges the hot-path (MAPPED_XDP_STATS) and cold-path (XDP_STATS)
+// per-CPU counters into a single XdpStats view.
+//
+// Why two maps?
+//   bump_mapped() writes rx_packets/rx_bytes/passed/dropped on EVERY packet
+//   (hot path, inlined, zero branch overhead).
+//   bump_stat() writes rate_limited/failsafe_drops/redirected/parse_errors on
+//   exception paths only (cold path, slightly heavier).
+//
+// Merge rule:
+//   rx_packets / rx_bytes / passed → MAPPED  (never written to XDP_STATS)
+//   dropped                        → MAPPED  (covers blocklist + failsafe drops)
+//   rate_limited / failsafe_drops / redirected / parse_errors / *bans → XDP_STATS
 func (m *Manager) ReadStats() (XdpStats, error) {
-	// XDP_STATS is a PerCpuArray — each CPU has its own value
-	// cilium/ebpf returns []T for per-CPU maps
-	var perCPU []XdpStats
 	var key uint32 = StatsIdx
 
-	if err := m.xdpStats.Lookup(&key, &perCPU); err != nil {
-		return XdpStats{}, fmt.Errorf("stats lookup failed: %w", err)
+	// ── 1. Aggregate cold-path XDP_STATS across CPUs ─────────────────────────
+	var coldPerCPU []XdpStats
+	if err := m.xdpStats.Lookup(&key, &coldPerCPU); err != nil {
+		return XdpStats{}, fmt.Errorf("xdp_stats lookup failed: %w", err)
+	}
+	var cold XdpStats
+	for _, s := range coldPerCPU {
+		cold = cold.Add(s)
 	}
 
-	var total XdpStats
-	for _, s := range perCPU {
-		total = total.Add(s)
+	// ── 2. Aggregate hot-path MAPPED_XDP_STATS across CPUs ───────────────────
+	var hotPerCPU []MappedXdpStats
+	if err := m.mappedStats.Lookup(&key, &hotPerCPU); err != nil {
+		return XdpStats{}, fmt.Errorf("mapped_xdp_stats lookup failed: %w", err)
 	}
-	return total, nil
+	var hot MappedXdpStats
+	for _, s := range hotPerCPU {
+		hot = hot.Add(s)
+	}
+
+	// ── 3. Merge: hot-path fields override cold-path; extended fields from cold ─
+	return XdpStats{
+		RxPackets:     hot.RxPackets,   // ALL packets — only in MAPPED
+		RxBytes:       hot.RxBytes,     // ALL bytes   — only in MAPPED
+		Dropped:       hot.Dropped,     // blocklist + failsafe drops
+		RateLimited:   cold.RateLimited,
+		Passed:        hot.Passed,      // ALL passed  — only in MAPPED
+		Redirected:    cold.Redirected,
+		FailsafeDrops: cold.FailsafeDrops,
+		ParseErrors:   cold.ParseErrors,
+		MapErrors:     cold.MapErrors,
+		CoolingBans:   cold.CoolingBans,
+		SynFloodBans:  cold.SynFloodBans,
+		LastResetNs:   cold.LastResetNs,
+	}, nil
 }
 
 // ─── Failsafe ─────────────────────────────────────────────────────────────────

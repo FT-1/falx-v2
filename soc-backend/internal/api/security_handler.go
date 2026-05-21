@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"regexp"
 	"time"
 
@@ -22,6 +23,12 @@ import (
 	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
 	"github.com/ft-1/falx-v2/control-plane/pkg/events"
 )
+
+// adminOverrideLatchPath is the cross-process sentinel file that tells the
+// falxd failsafe engine to suppress algorithmic re-tripping for 5 minutes
+// after a SOC operator manually closes the circuit. The engine polls this
+// file on every tick (200 ms) via os.Stat — no IPC needed.
+const adminOverrideLatchPath = "/run/falx/admin_override"
 
 // falxTomlPath is where persistFailsafeThresholds writes runtime threshold
 // changes so they survive a falx-user restart (which re-reads falx.toml and
@@ -261,6 +268,11 @@ func (h *SecurityHandler) ForceOpenCircuit(w http.ResponseWriter, r *http.Reques
 		writeAPIError(w, http.StatusInternalServerError, "failsafe_failed", err.Error())
 		return
 	}
+
+	// Clear the admin override sentinel so the failsafe engine in falxd
+	// resumes algorithmic detection immediately.
+	_ = os.Remove(adminOverrideLatchPath)
+
 	h.bus.Publish(events.CircuitOpenEvent(0, reason))
 	h.log.Warn("Circuit breaker FORCE OPENED via SOC",
 		zap.String("actor", claims.UserID), zap.String("reason", req.Reason))
@@ -281,9 +293,22 @@ func (h *SecurityHandler) ForceCloseCircuit(w http.ResponseWriter, r *http.Reque
 		writeAPIError(w, http.StatusInternalServerError, "failsafe_failed", err.Error())
 		return
 	}
+
+	// Touch the cross-process admin override sentinel. The failsafe engine in
+	// falxd polls this file on every 200 ms tick: if it exists and is newer
+	// than 5 minutes, tickClosed() suppresses algorithmic re-tripping (which
+	// would otherwise re-open the circuit in ~600 ms because cumulative
+	// drop/rx ratio remains > 90% during an ongoing flood).
+	_ = os.MkdirAll("/run/falx", 0o755)
+	_ = os.WriteFile(adminOverrideLatchPath, []byte("1"), 0o644)
+
 	h.bus.Publish(events.CircuitClosedEvent(0))
-	writeJSON(w, http.StatusOK, map[string]string{
-		"message": "Circuit breaker closed — AI inference restored",
+	h.log.Warn("Circuit breaker FORCE CLOSED via SOC — admin override latch armed (5 min)",
+		zap.String("actor", claims.UserID))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message":                "Circuit breaker closed — AI inference restored",
+		"admin_override_active":  true,
+		"admin_override_expires": time.Now().Add(5 * time.Minute),
 	})
 }
 
@@ -327,6 +352,20 @@ func (h *SecurityHandler) UpdateThresholds(w http.ResponseWriter, r *http.Reques
 			zap.String("path", falxTomlPath), zap.Error(err))
 		resp["warning"] = "BPF map updated. falx.toml persistence failed: " + err.Error() +
 			" — values will revert on next falx-user restart."
+	} else {
+		// Toml written — tell falxd to hot-reload so its in-memory detector
+		// thresholds sync without a full restart. systemctl reload maps to
+		// ExecReload=/bin/kill -HUP $MAINPID in the unit file.
+		if err := exec.Command("systemctl", "reload", "falxd").Run(); err != nil {
+			h.log.Warn("Failsafe thresholds: falx.toml updated but falxd reload failed "+
+				"(in-memory thresholds will sync on next restart)",
+				zap.Error(err))
+		} else {
+			h.log.Info("Failsafe thresholds: falxd reloaded in-memory thresholds",
+				zap.Uint64("pps", req.PPSThreshold),
+				zap.Uint64("bps", req.BPSThreshold),
+			)
+		}
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

@@ -76,6 +76,7 @@ func NewManager(bus *events.Bus, log *zap.Logger) *Manager {
 		events.TopicCircuitClosed, events.TopicCircuitHalfOpen,
 		events.TopicAuthFailed, events.TopicUserLocked,
 		events.TopicHoneypotHit, events.TopicConfigChanged,
+		events.TopicMetricsSnapshot, // high-frequency; broadcast only, not stored
 	)
 
 	m := &Manager{
@@ -114,13 +115,16 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 func (m *Manager) dispatch(ev events.Event) {
-	// Store notification
-	notif := Notification{
-		ID:        ev.ID,
-		Event:     ev,
-		CreatedAt: time.Now().UTC(),
+	// Metrics snapshots are broadcast-only: do NOT store them in the ring buffer
+	// because they arrive every second and would push real alerts out of the store.
+	if ev.Topic != events.TopicMetricsSnapshot {
+		notif := Notification{
+			ID:        ev.ID,
+			Event:     ev,
+			CreatedAt: time.Now().UTC(),
+		}
+		m.storeNotification(notif)
 	}
-	m.storeNotification(notif)
 
 	// WebSocket broadcast
 	m.wsHub.Broadcast(ev)
@@ -179,6 +183,13 @@ func (m *Manager) MarkRead(id string) {
 	}
 }
 
+// ─── WebSocket timing constants ───────────────────────────────────────────────
+const (
+	writeWait  = 10 * time.Second // max time to complete a single write
+	pongWait   = 60 * time.Second // max silence before declaring client dead
+	pingPeriod = 30 * time.Second // must be less than pongWait
+)
+
 // ─── WebSocket Hub ────────────────────────────────────────────────────────────
 type WSHub struct {
 	mu      sync.RWMutex
@@ -188,12 +199,22 @@ type WSHub struct {
 	upgrader websocket.Upgrader
 }
 
+// wsClient holds the per-connection state.
+// All writes to conn are owned exclusively by writePump — never written from
+// any other goroutine. quit signals writePump to send a CloseMessage and exit;
+// sync.Once prevents double-close if both readPump and closeAll fire together.
 type wsClient struct {
-	id     string
-	conn   *websocket.Conn
-	send   chan []byte
-	userID string
-	role   string
+	id       string
+	conn     *websocket.Conn
+	send     chan []byte
+	userID   string
+	role     string
+	quit     chan struct{}
+	quitOnce sync.Once
+}
+
+func (c *wsClient) closeQuit() {
+	c.quitOnce.Do(func() { close(c.quit) })
 }
 
 func newWSHub(log *zap.Logger) *WSHub {
@@ -211,23 +232,19 @@ func newWSHub(log *zap.Logger) *WSHub {
 	}
 }
 
+// Run blocks until ctx is cancelled, then sends CloseMessage to every client.
+// Ping/pong keepalive is handled per-client inside writePump — no hub-level
+// ticker needed, which was the source of the concurrent-write panic.
 func (h *WSHub) Run(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			h.closeAll()
-			return
-		case <-ticker.C:
-			h.ping()
-		}
-	}
+	<-ctx.Done()
+	h.closeAll()
 }
 
 // HandleUpgrade upgrades an HTTP connection to WebSocket.
-// Called by the SOC backend HTTP handler.
-func (h *WSHub) HandleUpgrade(w http.ResponseWriter, r *http.Request, userID, role string) {
+// seedData is an optional slice of pre-serialised JSON frames (e.g. the last
+// 60 seconds of metrics snapshots) queued before the pumps start so that
+// charts draw immediately on connect without waiting for the next tick.
+func (h *WSHub) HandleUpgrade(w http.ResponseWriter, r *http.Request, userID, role string, seedData [][]byte) {
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		h.log.Error("WS upgrade failed", zap.Error(err))
@@ -238,8 +255,17 @@ func (h *WSHub) HandleUpgrade(w http.ResponseWriter, r *http.Request, userID, ro
 		id:     userID + "_" + time.Now().Format("150405"),
 		conn:   conn,
 		send:   make(chan []byte, 256),
+		quit:   make(chan struct{}),
 		userID: userID,
 		role:   role,
+	}
+
+	// Seed historical frames before pumps start so they arrive first.
+	for _, frame := range seedData {
+		select {
+		case client.send <- frame:
+		default:
+		}
 	}
 
 	h.mu.Lock()
@@ -249,12 +275,16 @@ func (h *WSHub) HandleUpgrade(w http.ResponseWriter, r *http.Request, userID, ro
 	h.log.Info("WebSocket client connected",
 		zap.String("user_id", userID),
 		zap.String("role", role),
+		zap.Int("seed_frames", len(seedData)),
 	)
 
 	go h.writePump(client)
 	go h.readPump(client)
 }
 
+// Broadcast serialises ev and enqueues it for every connected client.
+// Uses a three-way select so a disconnecting client (quit closed) or a slow
+// client (send full) never blocks the broadcast loop.
 func (h *WSHub) Broadcast(ev events.Event) {
 	data, err := json.Marshal(ev)
 	if err != nil {
@@ -267,34 +297,64 @@ func (h *WSHub) Broadcast(ev events.Event) {
 	for _, client := range h.clients {
 		select {
 		case client.send <- data:
+		case <-client.quit:
+			// client is in the process of disconnecting — skip safely
 		default:
-			// Slow client — drop this event
+			// slow consumer — drop this frame rather than block
 		}
 	}
 }
 
+// writePump is the SOLE writer on c.conn for the lifetime of the connection.
+// It handles both data frames (from c.send) and ping keepalives (internal
+// ticker). Moving the ping here is what eliminates the concurrent-write panic:
+// the old hub-level ping() goroutine was calling WriteMessage on c.conn at the
+// same time as writePump, which gorilla/websocket explicitly forbids.
 func (h *WSHub) writePump(c *wsClient) {
+	ticker := time.NewTicker(pingPeriod)
 	defer func() {
+		ticker.Stop()
 		c.conn.Close()
 		h.mu.Lock()
 		delete(h.clients, c.id)
 		h.mu.Unlock()
 	}()
 
-	for data := range c.send {
-		c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+	for {
+		select {
+		case data, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+				return
+			}
+
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+
+		case <-c.quit:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 			return
 		}
 	}
 }
 
+// readPump drains incoming frames and resets the pong deadline on each pong.
+// When the connection drops it closes c.quit, which wakes writePump so it can
+// send a CloseMessage and clean up — no need to close c.send directly.
 func (h *WSHub) readPump(c *wsClient) {
-	defer close(c.send)
+	defer c.closeQuit()
 	c.conn.SetReadLimit(512)
-	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
-		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		return nil
 	})
 	for {
@@ -304,20 +364,13 @@ func (h *WSHub) readPump(c *wsClient) {
 	}
 }
 
-func (h *WSHub) ping() {
+// closeAll signals every client to disconnect gracefully. writePump goroutines
+// wake on c.quit, send CloseMessage, then remove themselves from h.clients.
+func (h *WSHub) closeAll() {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for _, c := range h.clients {
-		c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-		c.conn.WriteMessage(websocket.PingMessage, nil)
-	}
-}
-
-func (h *WSHub) closeAll() {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for _, c := range h.clients {
-		c.conn.Close()
+		c.closeQuit()
 	}
 }
 

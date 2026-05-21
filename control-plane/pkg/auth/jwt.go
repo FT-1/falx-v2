@@ -146,14 +146,18 @@ func (m *JWTManager) parseKeys(privPEM, pubPEM []byte) error {
 // ─── Internal Claims (extends jwt.RegisteredClaims) ──────────────────────────
 type falxClaims struct {
 	jwt.RegisteredClaims
-	Username  string `json:"username"`
-	Role      Role   `json:"role"`
-	SessionID string `json:"sid"`
-	TokenType string `json:"type"`
+	Username    string       `json:"username"`
+	Role        Role         `json:"role"`
+	SessionID   string       `json:"sid"`
+	TokenType   string       `json:"type"`
+	TFAVerified bool         `json:"tfa_ok"`
+	Scope       string       `json:"scope"`
+	Permissions []Permission `json:"perms"`
 }
 
 // ─── Access Token ─────────────────────────────────────────────────────────────
-func (m *JWTManager) GenerateAccessToken(user *User, sessionID string) (string, time.Time, error) {
+// scope must be ScopePreAuth or ScopeSession (defined in models.go).
+func (m *JWTManager) GenerateAccessToken(user *User, sessionID string, tfaVerified bool, scope string) (string, time.Time, error) {
 	now    := time.Now()
 	expiry := now.Add(m.cfg.AccessTokenTTL)
 
@@ -165,10 +169,13 @@ func (m *JWTManager) GenerateAccessToken(user *User, sessionID string) (string, 
 			ExpiresAt: jwt.NewNumericDate(expiry),
 			NotBefore: jwt.NewNumericDate(now),
 		},
-		Username:  user.Username,
-		Role:      user.Role,
-		SessionID: sessionID,
-		TokenType: "access",
+		Username:    user.Username,
+		Role:        user.Role,
+		SessionID:   sessionID,
+		TokenType:   "access",
+		TFAVerified: tfaVerified,
+		Scope:       scope,
+		Permissions: RolePermissions[user.Role],
 	}
 
 	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
@@ -236,13 +243,16 @@ func (m *JWTManager) VerifyAccessToken(tokenStr string) (*TokenClaims, error) {
 	}
 
 	return &TokenClaims{
-		UserID:    claims.Subject,
-		Username:  claims.Username,
-		Role:      claims.Role,
-		SessionID: claims.SessionID,
-		IssuedAt:  claims.IssuedAt.Unix(),
-		ExpiresAt: claims.ExpiresAt.Unix(),
-		TokenType: claims.TokenType,
+		UserID:      claims.Subject,
+		Username:    claims.Username,
+		Role:        claims.Role,
+		SessionID:   claims.SessionID,
+		IssuedAt:    claims.IssuedAt.Unix(),
+		ExpiresAt:   claims.ExpiresAt.Unix(),
+		TokenType:   claims.TokenType,
+		TFAVerified: claims.TFAVerified,
+		Scope:       claims.Scope,
+		Permissions: claims.Permissions,
 	}, nil
 }
 

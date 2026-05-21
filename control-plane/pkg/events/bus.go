@@ -58,9 +58,10 @@ const (
 	TopicUserLocked      Topic = "admin.user.locked"
 	TopicConfigChanged   Topic = "admin.config.changed"
 	TopicPolicyChanged   Topic = "admin.policy.changed"
-	TopicHoneypotHit     Topic = "honeypot.session.new"
-	TopicSystemHealth    Topic = "system.health"
-	TopicMapHardening    Topic = "security.map.hardening"
+	TopicHoneypotHit      Topic = "honeypot.session.new"
+	TopicSystemHealth     Topic = "system.health"
+	TopicMapHardening     Topic = "security.map.hardening"
+	TopicMetricsSnapshot  Topic = "metrics.stats.snapshot" // high-frequency: 1/sec, not stored in notification ring
 )
 
 // ─── Severity ─────────────────────────────────────────────────────────────────
@@ -284,6 +285,22 @@ func PolicyChangedEvent(actorID, action, ruleName string) Event {
 		Source:   "policy-engine",
 		ActorID:  actorID,
 		Meta:     map[string]string{"rule": ruleName, "action": action},
+	}
+}
+
+func MetricsSnapshotEvent(pps, dropPPS, passPPS, limitedPPS, mbps float64) Event {
+	return Event{
+		Topic:    TopicMetricsSnapshot,
+		Severity: SeverityInfo,
+		Title:    "metrics.snapshot",
+		Source:   "metrics-streamer",
+		Meta: map[string]string{
+			"pps":         fmt.Sprintf("%.2f", pps),
+			"drop_pps":    fmt.Sprintf("%.2f", dropPPS),
+			"pass_pps":    fmt.Sprintf("%.2f", passPPS),
+			"limited_pps": fmt.Sprintf("%.2f", limitedPPS),
+			"mbps":        fmt.Sprintf("%.4f", mbps),
+		},
 	}
 }
 

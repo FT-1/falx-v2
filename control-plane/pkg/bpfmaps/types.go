@@ -12,7 +12,9 @@
 //              Layout (all little-endian, matching x86-64 BPF):
 //                BlockEntry    = 16 bytes
 //                RateBucket    = 40 bytes
-//                XdpStats      = 80 bytes
+//                CoolingEntry  = 16 bytes
+//                SynCountEntry =  8 bytes
+//                XdpStats      = 96 bytes  (Phase-11: +CoolingBans +SynFloodBans)
 //                FailsafeState = 56 bytes
 //                FalxMapConfig = 32 bytes
 // =============================================================================
@@ -48,9 +50,59 @@ type RateBucket struct {
 	DropCount  uint64 // Cumulative drops from this source
 }
 
+// ─── CoolingEntry ─────────────────────────────────────────────────────────────
+// Stored in COOLING_TRACKER LRU map. Key: uint32 (source IPv4, network order).
+// Option B: no bpf_spin_lock — BTF-free, race-tolerant best-effort escalation.
+// T_ban = 10 s × 2^RepeatCount, capped at RepeatCount = 16 (≈ 7.5 days).
+type CoolingEntry struct {
+	RepeatCount   uint32 // exponent r in T_ban = 10s << r
+	Pad           uint32
+	LastBanAtNs   uint64 // CLOCK_MONOTONIC nanoseconds (bpf_ktime_get_ns)
+}
+
+// ─── SynCountEntry ────────────────────────────────────────────────────────────
+// Stored in SYN_COUNTER LRU map. Key: uint32 (source IPv4, network order).
+// SynCount is reset to 0 on ACK. When SynCount ≥ 50 with AckCount == 0, a
+// max-penalty cooling ban (r ≥ 8, T_ban ≥ 2 560 s) is issued.
+type SynCountEntry struct {
+	SynCount uint32 // consecutive SYN-only packets without a completing ACK
+	AckCount uint32 // ACK packets seen (handshake completions)
+}
+
+// ─── MappedXdpStats ───────────────────────────────────────────────────────────
+// Stored in MAPPED_XDP_STATS PerCpuArray at index 0.
+// 6 × u64 = 48 bytes (one cache line).  Written by bump_mapped() on the HOT
+// PATH for every packet.  MUST match ebpf-kern/src/types.rs MappedXdpStats.
+//
+// Why two maps? bump_mapped() is inlined into the hot path (zero branching);
+// bump_stat() handles cold-path extended counters with slightly more overhead.
+// Go ReadStats() merges both: hot-path fields come from here, extended counters
+// (rate_limited, failsafe_drops, redirected, etc.) come from XDP_STATS.
+type MappedXdpStats struct {
+	RxPackets    uint64
+	RxBytes      uint64
+	Dropped      uint64 // blocklist + failsafe drops only (not rate-limited)
+	DroppedBytes uint64
+	Passed       uint64
+	PassedBytes  uint64
+}
+
+// Add aggregates per-CPU MappedXdpStats (saturating)
+func (a MappedXdpStats) Add(b MappedXdpStats) MappedXdpStats {
+	return MappedXdpStats{
+		RxPackets:    safeAdd(a.RxPackets, b.RxPackets),
+		RxBytes:      safeAdd(a.RxBytes, b.RxBytes),
+		Dropped:      safeAdd(a.Dropped, b.Dropped),
+		DroppedBytes: safeAdd(a.DroppedBytes, b.DroppedBytes),
+		Passed:       safeAdd(a.Passed, b.Passed),
+		PassedBytes:  safeAdd(a.PassedBytes, b.PassedBytes),
+	}
+}
+
 // ─── XdpStats ─────────────────────────────────────────────────────────────────
 // Stored in XDP_STATS PerCpuArray at index 0.
 // Aggregated across all CPUs by the control plane.
+// Phase-11: added CoolingBans (field 10) and SynFloodBans (field 11) — total 96 bytes.
 type XdpStats struct {
 	RxPackets     uint64
 	RxBytes       uint64
@@ -61,6 +113,8 @@ type XdpStats struct {
 	FailsafeDrops uint64
 	ParseErrors   uint64
 	MapErrors     uint64
+	CoolingBans   uint64 // auto-bans from rate-limiter cooling tracker
+	SynFloodBans  uint64 // auto-bans from SYN flood heuristic (r ≥ 8)
 	LastResetNs   uint64
 }
 
@@ -76,6 +130,8 @@ func (a XdpStats) Add(b XdpStats) XdpStats {
 		FailsafeDrops: safeAdd(a.FailsafeDrops, b.FailsafeDrops),
 		ParseErrors:   safeAdd(a.ParseErrors, b.ParseErrors),
 		MapErrors:     safeAdd(a.MapErrors, b.MapErrors),
+		CoolingBans:   safeAdd(a.CoolingBans, b.CoolingBans),
+		SynFloodBans:  safeAdd(a.SynFloodBans, b.SynFloodBans),
 		LastResetNs:   maxU64(a.LastResetNs, b.LastResetNs),
 	}
 }
@@ -125,6 +181,7 @@ const (
 	ReasonFailsafe   uint32 = 0x0003
 	ReasonParseErr   uint32 = 0x0004
 	ReasonAIVerdict  uint32 = 0x0005
+	ReasonCoolingBan uint32 = 0x0006
 )
 
 // ─── Map Index Constants ──────────────────────────────────────────────────────
@@ -144,11 +201,14 @@ func init() {
 		want uintptr
 	}
 	checks := []sizeCheck{
-		{"BlockEntry",    unsafe.Sizeof(BlockEntry{}),    16},
-		{"RateBucket",    unsafe.Sizeof(RateBucket{}),    40},
-		{"XdpStats",      unsafe.Sizeof(XdpStats{}),      80},
-		{"FailsafeState", unsafe.Sizeof(FailsafeState{}), 56},
-		{"FalxMapConfig", unsafe.Sizeof(FalxMapConfig{}), 32},
+		{"BlockEntry",      unsafe.Sizeof(BlockEntry{}),      16},
+		{"RateBucket",      unsafe.Sizeof(RateBucket{}),      40},
+		{"CoolingEntry",    unsafe.Sizeof(CoolingEntry{}),    16},
+		{"SynCountEntry",   unsafe.Sizeof(SynCountEntry{}),    8},
+		{"MappedXdpStats",  unsafe.Sizeof(MappedXdpStats{}),  48},
+		{"XdpStats",        unsafe.Sizeof(XdpStats{}),        96},
+		{"FailsafeState",   unsafe.Sizeof(FailsafeState{}),   56},
+		{"FalxMapConfig",   unsafe.Sizeof(FalxMapConfig{}),   32},
 	}
 	for _, c := range checks {
 		if c.got != c.want {

@@ -173,6 +173,10 @@ fn pin_maps(ebpf: &mut Ebpf, pin_base: &Path) -> Result<()> {
         "BLOCKLIST_V6",
         "RATE_LIMIT",
         "XDP_STATS",
+        // MAPPED_XDP_STATS is the hot-path per-CPU accumulator written by
+        // bump_mapped() for rx_packets / rx_bytes / passed / dropped.
+        // It MUST be pinned so the Go control plane can read live counters.
+        "MAPPED_XDP_STATS",
         "FAILSAFE_STATE",
         "CONFIG",
         "XSK_MAP",

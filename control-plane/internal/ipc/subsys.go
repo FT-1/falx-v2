@@ -13,14 +13,12 @@ package ipc
 
 import (
 	"context"
-	"encoding/json"
 	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/ft-1/falx-v2/control-plane/internal/afxdp"
-	"github.com/ft-1/falx-v2/control-plane/pkg/bpfmaps"
 )
 
 // ─── IPC Subsystem ────────────────────────────────────────────────────────────

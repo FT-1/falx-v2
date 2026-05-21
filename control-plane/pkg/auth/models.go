@@ -47,6 +47,16 @@ func (r Role) Level() int {
 	}
 }
 
+// Requires2FA reports whether 2FA is mandatory for this role. Two-factor auth
+// is enforced ONLY for the admin tier (admin, super_admin), which holds the
+// high-privilege user/policy/system management permissions. Lower-privilege
+// roles (senior_analyst, analyst, viewer) authenticate with username+password
+// alone — they are read-only / limited-scope accounts where a TOTP enrollment
+// step would add friction without protecting privileged operations.
+func (r Role) Requires2FA() bool {
+	return r == RoleSuperAdmin || r == RoleAdmin
+}
+
 // ─── Permissions ──────────────────────────────────────────────────────────────
 type Permission string
 
@@ -212,15 +222,28 @@ func (s *Session) IsInactive(timeout time.Duration) bool {
 	return time.Since(s.LastActivityAt) > timeout
 }
 
+// ─── Token Scopes ─────────────────────────────────────────────────────────────
+const (
+	// ScopePreAuth is issued on login before TOTP enrollment is complete.
+	// Grants access only to /auth/totp/begin and /auth/totp/confirm.
+	ScopePreAuth = "pre_auth"
+
+	// ScopeSession is the full-access scope issued after TOTP is verified.
+	ScopeSession = "session"
+)
+
 // ─── Token Claims (JWT payload) ───────────────────────────────────────────────
 type TokenClaims struct {
-	UserID    string     `json:"sub"`
-	Username  string     `json:"username"`
-	Role      Role       `json:"role"`
-	SessionID string     `json:"sid"`
-	IssuedAt  int64      `json:"iat"`
-	ExpiresAt int64      `json:"exp"`
-	TokenType string     `json:"type"` // "access" | "refresh"
+	UserID      string       `json:"sub"`
+	Username    string       `json:"username"`
+	Role        Role         `json:"role"`
+	SessionID   string       `json:"sid"`
+	IssuedAt    int64        `json:"iat"`
+	ExpiresAt   int64        `json:"exp"`
+	TokenType   string       `json:"type"`    // "access"
+	TFAVerified bool         `json:"tfa_ok"`
+	Scope       string       `json:"scope"`
+	Permissions []Permission `json:"perms"`
 }
 
 // ─── Token Pair ───────────────────────────────────────────────────────────────

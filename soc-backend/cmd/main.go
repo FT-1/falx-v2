@@ -43,6 +43,8 @@ func main() {
 	jwtPub     := flag.String("jwt-pub",  "/etc/falx/keys/jwt_public.pem",  "JWT public key")
 	verbose    := flag.Bool("verbose",    false, "Debug logging")
 	versionFlag:= flag.Bool("version",   false, "Print version")
+	devMode    := flag.Bool("dev",        os.Getenv("FALX_DEV") == "1",
+		"Dev mode: fixed admin TOTP, auto-unlock accounts, print token on startup")
 	flag.Parse()
 
 	if *versionFlag {
@@ -70,6 +72,7 @@ func main() {
 		PinPath:     *pinPath,
 		JWTPrivPath: *jwtPriv,
 		JWTPubPath:  *jwtPub,
+		Dev:         *devMode,
 		AllowedOrigins: []string{
 			"http://localhost:3000",
 			"http://localhost:8080",

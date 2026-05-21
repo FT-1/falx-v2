@@ -10,6 +10,7 @@ package api
 
 import (
 	"net/http"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -19,11 +20,26 @@ import (
 	"github.com/ft-1/falx-v2/control-plane/pkg/policy"
 )
 
+// MetricsRates holds per-second traffic rates computed by the metrics streamer.
+// Updated every second; read by Stats() to include live rates in the response.
+type MetricsRates struct {
+	PPS        float64   `json:"pps"`
+	DropPPS    float64   `json:"drop_pps"`
+	PassPPS    float64   `json:"pass_pps"`
+	LimitedPPS float64   `json:"limited_pps"`
+	MBps       float64   `json:"mbps"`
+	SampledAt  time.Time `json:"sampled_at"`
+}
+
 type DashboardHandler struct {
+	bpfMgrMu  sync.RWMutex
 	bpfMgr    *bpfmaps.Manager
 	policyEng *policy.Engine
 	bus       *events.Bus
 	log       *zap.Logger
+
+	ratesMu sync.RWMutex
+	rates   MetricsRates
 }
 
 func NewDashboardHandler(
@@ -33,6 +49,34 @@ func NewDashboardHandler(
 	log *zap.Logger,
 ) *DashboardHandler {
 	return &DashboardHandler{bpfMgr: mgr, policyEng: eng, bus: bus, log: log}
+}
+
+// SetBPFMgr swaps in a live BPF manager after it becomes available (late-attach).
+// Called by runMetricsStreamer when falxd pins its maps after falx-soc started.
+func (h *DashboardHandler) SetBPFMgr(mgr *bpfmaps.Manager) {
+	h.bpfMgrMu.Lock()
+	h.bpfMgr = mgr
+	h.bpfMgrMu.Unlock()
+}
+
+func (h *DashboardHandler) getBPFMgr() *bpfmaps.Manager {
+	h.bpfMgrMu.RLock()
+	defer h.bpfMgrMu.RUnlock()
+	return h.bpfMgr
+}
+
+// UpdateRates is called by the metrics streamer goroutine (in server.go) every
+// second with freshly computed per-second rates. Thread-safe.
+func (h *DashboardHandler) UpdateRates(r MetricsRates) {
+	h.ratesMu.Lock()
+	h.rates = r
+	h.ratesMu.Unlock()
+}
+
+func (h *DashboardHandler) currentRates() MetricsRates {
+	h.ratesMu.RLock()
+	defer h.ratesMu.RUnlock()
+	return h.rates
 }
 
 // ─── GET /api/v1/dashboard ────────────────────────────────────────────────────
@@ -45,8 +89,9 @@ func (h *DashboardHandler) Overview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// XDP stats
-	if h.bpfMgr != nil {
-		if stats, err := h.bpfMgr.ReadStats(); err == nil {
+	bpfMgr := h.getBPFMgr()
+	if bpfMgr != nil {
+		if stats, err := bpfMgr.ReadStats(); err == nil {
 			overview["xdp"] = map[string]uint64{
 				"rx_packets":     stats.RxPackets,
 				"rx_bytes":       stats.RxBytes,
@@ -58,7 +103,7 @@ func (h *DashboardHandler) Overview(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// Failsafe
-		if fs, err := h.bpfMgr.ReadFailsafeState(); err == nil {
+		if fs, err := bpfMgr.ReadFailsafeState(); err == nil {
 			overview["failsafe"] = map[string]interface{}{
 				"circuit_open": fs.CircuitOpen == 1,
 				"current_pps": fs.CurrentPPS,
@@ -66,7 +111,7 @@ func (h *DashboardHandler) Overview(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		// Rate limiter
-		overview["rate_limiter"] = h.bpfMgr.RateLimiterStats()
+		overview["rate_limiter"] = bpfMgr.RateLimiterStats()
 	}
 
 	// Policy stats
@@ -91,38 +136,50 @@ func (h *DashboardHandler) Overview(w http.ResponseWriter, r *http.Request) {
 
 // ─── GET /api/v1/dashboard/stats ─────────────────────────────────────────────
 func (h *DashboardHandler) Stats(w http.ResponseWriter, r *http.Request) {
-	if h.bpfMgr == nil {
+	bpfMgr := h.getBPFMgr()
+	if bpfMgr == nil {
 		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"note": "BPF unavailable — stub mode", "timestamp": time.Now().UTC(),
+			"note": "BPF unavailable — falxd not running yet", "timestamp": time.Now().UTC(),
 		})
 		return
 	}
-	stats, err := h.bpfMgr.ReadStats()
+	stats, err := bpfMgr.ReadStats()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "stats_error", err.Error())
 		return
 	}
 
-	// Calculate derived metrics
-	total    := stats.RxPackets
-	dropPct  := 0.0
-	if total > 0 {
-		drops   := stats.Dropped + stats.RateLimited + stats.FailsafeDrops
-		dropPct  = float64(drops) / float64(total) * 100
+	dropPct := 0.0
+	if stats.RxPackets > 0 {
+		// Dropped already includes FailsafeDrops (both come from MAPPED_XDP_STATS
+		// hot-path). Adding FailsafeDrops again would double-count them.
+		drops   := stats.Dropped + stats.RateLimited
+		dropPct = float64(drops) / float64(stats.RxPackets) * 100
 	}
 
+	// Per-second rates computed by the metrics streamer goroutine (accurate 1 s
+	// rolling window). Falls back to zero until the first streamer tick fires.
+	rates := h.currentRates()
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"rx_packets":        stats.RxPackets,
-		"rx_bytes":          stats.RxBytes,
-		"rx_mbps":           float64(stats.RxBytes) * 8 / 1_000_000,
-		"dropped":           stats.Dropped,
-		"rate_limited":      stats.RateLimited,
-		"failsafe_drops":    stats.FailsafeDrops,
-		"passed":            stats.Passed,
-		"redirected":        stats.Redirected,
-		"parse_errors":      stats.ParseErrors,
-		"drop_percentage":   dropPct,
-		"timestamp":         time.Now().UTC(),
+		// Cumulative totals (since daemon start)
+		"rx_packets":      stats.RxPackets,
+		"rx_bytes":        stats.RxBytes,
+		"dropped":         stats.Dropped,
+		"rate_limited":    stats.RateLimited,
+		"failsafe_drops":  stats.FailsafeDrops,
+		"passed":          stats.Passed,
+		"redirected":      stats.Redirected,
+		"parse_errors":    stats.ParseErrors,
+		"drop_percentage": dropPct,
+		// Per-second rates (rolling 1 s window — use these for PPS displays)
+		"pps":         rates.PPS,
+		"drop_pps":    rates.DropPPS,
+		"pass_pps":    rates.PassPPS,
+		"limited_pps": rates.LimitedPPS,
+		"mbps":        rates.MBps,
+		"rates_at":    rates.SampledAt,
+		"timestamp":   time.Now().UTC(),
 	})
 }
 
@@ -130,7 +187,7 @@ func (h *DashboardHandler) Stats(w http.ResponseWriter, r *http.Request) {
 func (h *DashboardHandler) Threats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"active_threats": []interface{}{},
-		"threat_level":   computeThreatLevel(h.bpfMgr),
+		"threat_level":   computeThreatLevel(h.getBPFMgr()),
 		"timestamp":      time.Now().UTC(),
 	})
 }

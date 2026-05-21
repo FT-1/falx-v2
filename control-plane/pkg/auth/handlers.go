@@ -61,6 +61,9 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		case ErrAccountLocked:
 			writeAPIError(w, http.StatusForbidden, "account_locked",
 				"Account is locked — contact your administrator")
+		case ErrTOTPRequired:
+			writeAPIError(w, http.StatusUnauthorized, "totp_required",
+				"2FA code required — enter your authenticator code")
 		default:
 			writeAPIError(w, http.StatusTooManyRequests, "rate_limited", err.Error())
 		}
@@ -282,7 +285,95 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v interface{}) bool {
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	enc.Encode(v)
+}
+
+// ─── POST /api/v1/auth/totp/begin ────────────────────────────────────────────
+// Starts TOTP enrollment for the calling user. Returns the provisioning URI,
+// raw base32 secret (for manual entry), and one-time plaintext backup codes.
+func (h *Handler) TOTPBegin(w http.ResponseWriter, r *http.Request) {
+	claims := ClaimsFromContext(r.Context())
+	enroll, err := h.svc.BeginTOTPSetup(claims.UserID)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "totp_begin_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"secret":           enroll.Secret,
+		"provisioning_uri": enroll.ProvisioningURI,
+		"backup_codes":     enroll.BackupCodes,
+		"qr_data_uri":      enroll.QRDataURI,
+		"username":         enroll.Username,
+		"role":             enroll.Role,
+	})
+}
+
+// ─── POST /api/v1/auth/totp/confirm ──────────────────────────────────────────
+// Confirms TOTP enrollment by verifying a live code from the authenticator app.
+// Activates 2FA and returns an upgraded access token with tfa_ok=true so the
+// frontend can replace the pending token without requiring a re-login.
+func (h *Handler) TOTPConfirm(w http.ResponseWriter, r *http.Request) {
+	claims := ClaimsFromContext(r.Context())
+	var req struct {
+		Code string `json:"code"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.Code) != 6 {
+		writeAPIError(w, http.StatusBadRequest, "invalid_code", "Code must be 6 digits")
+		return
+	}
+	backupCodes, err := h.svc.ConfirmTOTPSetup(claims.UserID, req.Code)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "totp_confirm_failed", err.Error())
+		return
+	}
+
+	// Issue upgraded token with tfa_ok=true so the frontend can persist it
+	// and transition directly to the dashboard without a page reload.
+	pair, err := h.svc.IssueUpgradedToken(claims.UserID, claims.SessionID)
+	if err != nil {
+		h.log.Warn("TOTP confirmed but token upgrade failed",
+			zap.String("user_id", claims.UserID), zap.Error(err))
+	}
+
+	h.log.Info("TOTP 2FA enabled", zap.String("user_id", claims.UserID))
+	resp := map[string]interface{}{
+		"message":      "2FA enabled successfully",
+		"backup_codes": backupCodes,
+	}
+	if pair != nil {
+		resp["tokens"] = pair
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ─── DELETE /api/v1/users/:id/totp ───────────────────────────────────────────
+// Disables 2FA for a user (super_admin only). Clears the TOTP secret and backup
+// codes, then revokes all active sessions so the user must re-login.
+func (h *Handler) TOTPDisable(w http.ResponseWriter, r *http.Request) {
+	actorClaims := ClaimsFromContext(r.Context())
+	targetID    := pathParam(r, "id")
+
+	if err := h.svc.DisableTOTPSetup(targetID, actorClaims.UserID, realIP(r)); err != nil {
+		switch err {
+		case ErrUserNotFound:
+			writeAPIError(w, http.StatusNotFound, "user_not_found", "")
+		default:
+			writeAPIError(w, http.StatusInternalServerError, "totp_disable_failed", err.Error())
+		}
+		return
+	}
+	h.log.Info("TOTP disabled",
+		zap.String("target_user", targetID),
+		zap.String("by", actorClaims.UserID),
+	)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"message": "2FA disabled — user sessions revoked, re-login required",
+	})
 }
 
 func pathParam(r *http.Request, name string) string {

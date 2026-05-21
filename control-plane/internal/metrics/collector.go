@@ -39,14 +39,16 @@ type Collector struct {
 	honeypotSessionFn func() int
 
 	// ── XDP Gauges ───────────────────────────────────────────────────────
-	xdpRxPackets   prometheus.Counter
-	xdpRxBytes     prometheus.Counter
-	xdpDropped     prometheus.Counter
-	xdpRateLimited prometheus.Counter
-	xdpPassed      prometheus.Counter
-	xdpRedirected  prometheus.Counter
-	xdpFailsafe    prometheus.Counter
-	xdpParseErrors prometheus.Counter
+	xdpRxPackets    prometheus.Counter
+	xdpRxBytes      prometheus.Counter
+	xdpDropped      prometheus.Counter
+	xdpRateLimited  prometheus.Counter
+	xdpPassed       prometheus.Counter
+	xdpRedirected   prometheus.Counter
+	xdpFailsafe     prometheus.Counter
+	xdpParseErrors  prometheus.Counter
+	xdpCoolingBans  prometheus.Counter
+	xdpSynFloodBans prometheus.Counter
 
 	// ── Failsafe Gauges ───────────────────────────────────────────────────
 	failsafeCircuitOpen prometheus.Gauge
@@ -112,14 +114,16 @@ func (c *Collector) SetHoneypotSessionFn(fn func() int) {
 // ─── Metric Registration ──────────────────────────────────────────────────────
 func (c *Collector) registerMetrics() {
 	// XDP
-	c.xdpRxPackets   = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "rx_packets_total",   Help: "Total packets received by XDP"})
-	c.xdpRxBytes     = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "rx_bytes_total",     Help: "Total bytes received by XDP"})
-	c.xdpDropped     = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "dropped_total",      Help: "Packets dropped by blocklist"})
-	c.xdpRateLimited = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "rate_limited_total", Help: "Packets dropped by rate limiter"})
-	c.xdpPassed      = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "passed_total",       Help: "Packets passed to network stack"})
-	c.xdpRedirected  = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "redirected_total",   Help: "Packets redirected to honeypot"})
-	c.xdpFailsafe    = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "failsafe_drops_total", Help: "Packets dropped by circuit breaker"})
-	c.xdpParseErrors = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "parse_errors_total", Help: "Malformed packet parse errors"})
+	c.xdpRxPackets    = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "rx_packets_total",     Help: "Total packets received by XDP"})
+	c.xdpRxBytes      = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "rx_bytes_total",       Help: "Total bytes received by XDP"})
+	c.xdpDropped      = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "dropped_total",        Help: "Packets dropped by blocklist"})
+	c.xdpRateLimited  = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "rate_limited_total",   Help: "Packets dropped by rate limiter"})
+	c.xdpPassed       = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "passed_total",         Help: "Packets passed to network stack"})
+	c.xdpRedirected   = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "redirected_total",     Help: "Packets redirected to honeypot"})
+	c.xdpFailsafe     = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "failsafe_drops_total", Help: "Packets dropped by circuit breaker"})
+	c.xdpParseErrors  = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "parse_errors_total",   Help: "Malformed packet parse errors"})
+	c.xdpCoolingBans  = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "cooling_bans_total",   Help: "Auto-bans from rate-limit cooling tracker"})
+	c.xdpSynFloodBans = prometheus.NewCounter(prometheus.CounterOpts{Namespace: "falx", Subsystem: "xdp", Name: "syn_flood_bans_total", Help: "Auto-bans from SYN flood heuristic (r≥8)"})
 
 	// Failsafe
 	c.failsafeCircuitOpen = prometheus.NewGauge(prometheus.GaugeOpts{Namespace: "falx", Subsystem: "failsafe", Name: "circuit_open",    Help: "1 = circuit OPEN (DDoS mode), 0 = CLOSED"})
@@ -151,6 +155,7 @@ func (c *Collector) registerMetrics() {
 	collectors := []prometheus.Collector{
 		c.xdpRxPackets, c.xdpRxBytes, c.xdpDropped, c.xdpRateLimited,
 		c.xdpPassed, c.xdpRedirected, c.xdpFailsafe, c.xdpParseErrors,
+		c.xdpCoolingBans, c.xdpSynFloodBans,
 		c.failsafeCircuitOpen, c.failsafeTripTotal, c.failsafeCloseTotal,
 		c.failsafeCurrentPPS, c.failsafeCurrentBPS, c.failsafeEMAPPS,
 		c.mapOpsAccepted, c.mapOpsDropped,
@@ -194,14 +199,16 @@ func (c *Collector) collect(prev *bpfmaps.XdpStats) {
 		c.log.Error("Metrics: failed to read XDP stats", zap.Error(err))
 	} else {
 		// Counters: add delta since last collection
-		addCounter(c.xdpRxPackets,   stats.RxPackets   - prev.RxPackets)
-		addCounter(c.xdpRxBytes,     stats.RxBytes     - prev.RxBytes)
-		addCounter(c.xdpDropped,     stats.Dropped     - prev.Dropped)
-		addCounter(c.xdpRateLimited, stats.RateLimited - prev.RateLimited)
-		addCounter(c.xdpPassed,      stats.Passed      - prev.Passed)
-		addCounter(c.xdpRedirected,  stats.Redirected  - prev.Redirected)
-		addCounter(c.xdpFailsafe,    stats.FailsafeDrops - prev.FailsafeDrops)
-		addCounter(c.xdpParseErrors, stats.ParseErrors - prev.ParseErrors)
+		addCounter(c.xdpRxPackets,    stats.RxPackets     - prev.RxPackets)
+		addCounter(c.xdpRxBytes,      stats.RxBytes       - prev.RxBytes)
+		addCounter(c.xdpDropped,      stats.Dropped       - prev.Dropped)
+		addCounter(c.xdpRateLimited,  stats.RateLimited   - prev.RateLimited)
+		addCounter(c.xdpPassed,       stats.Passed        - prev.Passed)
+		addCounter(c.xdpRedirected,   stats.Redirected    - prev.Redirected)
+		addCounter(c.xdpFailsafe,     stats.FailsafeDrops - prev.FailsafeDrops)
+		addCounter(c.xdpParseErrors,  stats.ParseErrors   - prev.ParseErrors)
+		addCounter(c.xdpCoolingBans,  stats.CoolingBans   - prev.CoolingBans)
+		addCounter(c.xdpSynFloodBans, stats.SynFloodBans  - prev.SynFloodBans)
 		*prev = stats
 	}
 

@@ -17,8 +17,11 @@
 package auth
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -43,7 +46,9 @@ type APIError struct {
 func writeAPIError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(APIError{Code: code, Message: message})
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	enc.Encode(APIError{Code: code, Message: message})
 }
 
 // ─── Middleware: RequireAuth ───────────────────────────────────────────────────
@@ -79,6 +84,50 @@ func (s *Service) RequireAuth(next http.Handler) http.Handler {
 		ctx  = context.WithValue(ctx, ctxKeyUserID, claims.UserID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// ─── Middleware: RequireTFAVerified ───────────────────────────────────────────
+// Blocks requests whose access token has tfa_ok=false. Apply after RequireAuth
+// on every route that requires a fully-authenticated session. Routes used during
+// TOTP enrollment itself (begin, confirm, logout) must NOT use this middleware.
+func (s *Service) RequireTFAVerified(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := ClaimsFromContext(r.Context())
+		if claims == nil {
+			writeAPIError(w, http.StatusUnauthorized, "missing_claims",
+				"Authentication required")
+			return
+		}
+		if !claims.TFAVerified {
+			writeAPIError(w, http.StatusForbidden, "tfa_setup_required",
+				"2FA setup required — complete enrollment via /auth/totp/begin and /auth/totp/confirm")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+
+// ─── Middleware: RequireScope ─────────────────────────────────────────────────
+// Rejects tokens whose scope field does not exactly match the required scope.
+// Apply after RequireAuth. Provides defence-in-depth behind RequireTFAVerified.
+func (s *Service) RequireScope(scope string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			claims := ClaimsFromContext(r.Context())
+			if claims == nil {
+				writeAPIError(w, http.StatusUnauthorized, "missing_claims",
+					"Authentication required")
+				return
+			}
+			if claims.Scope != scope {
+				writeAPIError(w, http.StatusForbidden, "insufficient_scope",
+					"Token scope '"+claims.Scope+"' does not satisfy required scope '"+scope+"'")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // ─── Middleware: RequirePermission ─────────────────────────────────────────────
@@ -231,9 +280,15 @@ func UserIDFromContext(ctx context.Context) string {
 func extractBearerToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
 	if auth == "" {
-		// Also check cookie (for browser-based SOC dashboard)
+		// Cookie fallback for browser-based SOC dashboard
 		if c, err := r.Cookie("falx_access_token"); err == nil {
 			return c.Value
+		}
+		// Query-param fallback for WebSocket connections — browsers cannot set
+		// custom headers on WS upgrade requests, so the frontend appends
+		// ?token=<access_token> to the ws:// URL.
+		if t := r.URL.Query().Get("token"); t != "" {
+			return t
 		}
 		return ""
 	}
@@ -253,6 +308,26 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.status = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// Hijack implements http.Hijacker so that WebSocket upgrades work when this
+// wrapper sits in the middleware chain. gorilla/websocket type-asserts the
+// ResponseWriter to http.Hijacker; without this the assertion fails and the
+// upgrade returns 500 "response does not implement http.Hijacker".
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := rw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("upstream ResponseWriter does not implement http.Hijacker")
+	}
+	return h.Hijack()
+}
+
+// Flush implements http.Flusher so that SSE and streaming responses work
+// correctly through this wrapper.
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 func realIP(r *http.Request) string {

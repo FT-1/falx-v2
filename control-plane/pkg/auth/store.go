@@ -38,6 +38,9 @@ var (
 	ErrInvalidCredentials = errors.New("invalid credentials")
 	ErrAccountLocked     = errors.New("account locked — contact administrator")
 	ErrInactivityTimeout = errors.New("session expired due to inactivity")
+	// ErrTOTPRequired is returned by Login when the user has 2FA enabled but
+	// did not supply a code. The frontend must re-prompt with the TOTP field.
+	ErrTOTPRequired      = errors.New("2FA code required")
 )
 
 // ─── Store ────────────────────────────────────────────────────────────────────
@@ -140,10 +143,18 @@ CREATE TABLE IF NOT EXISTS auth_audit (
     at          DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS backup_codes (
+    id       TEXT PRIMARY KEY,
+    user_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    code_hash TEXT NOT NULL,
+    used     INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_audit_user_id    ON auth_audit(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_at         ON auth_audit(at);
+CREATE INDEX IF NOT EXISTS idx_backup_codes_uid ON backup_codes(user_id);
 `
 	_, err := s.db.Exec(schema)
 	return err
@@ -237,6 +248,132 @@ func (s *Store) UpdateUser(u *User) error {
 		return err
 	}
 	s.users[u.ID] = u
+	return nil
+}
+
+// UpdateTOTPSecret atomically sets the user's TOTP secret and enabled flag.
+// Called once the operator confirms the first valid code during enrollment.
+func (s *Store) UpdateTOTPSecret(userID, secret string, enabled bool) error {
+	s.usersMu.Lock()
+	defer s.usersMu.Unlock()
+	now := time.Now().UTC()
+	_, err := s.db.Exec(
+		`UPDATE users SET totp_secret=?, totp_enabled=?, updated_at=? WHERE id=?`,
+		secret, boolToInt(enabled), now, userID,
+	)
+	if err != nil {
+		return err
+	}
+	if u, ok := s.users[userID]; ok {
+		u.TOTPSecret  = secret
+		u.TOTPEnabled = enabled
+		u.UpdatedAt   = now
+	}
+	return nil
+}
+
+// UpdateBackupCodes replaces all backup codes for a user with new hashed codes.
+// Called once during TOTP enrollment confirmation.
+func (s *Store) UpdateBackupCodes(userID string, hashedCodes []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if _, err := tx.Exec(`DELETE FROM backup_codes WHERE user_id=?`, userID); err != nil {
+		return err
+	}
+	for _, h := range hashedCodes {
+		id := newID()
+		if _, err := tx.Exec(
+			`INSERT INTO backup_codes (id, user_id, code_hash) VALUES (?,?,?)`,
+			id, userID, h,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// EnableTOTPWithBackupCodes atomically: sets totp_secret, enables TOTP, and
+// replaces all backup codes — all in a single SQLite transaction. Guarantees
+// no window where the secret is updated but backup codes are stale/absent.
+// Use this at ConfirmTOTPSetup instead of two separate UpdateTOTPSecret +
+// UpdateBackupCodes calls.
+func (s *Store) EnableTOTPWithBackupCodes(userID, secret string, hashedCodes []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	now := time.Now().UTC()
+	if _, err := tx.Exec(
+		`UPDATE users SET totp_secret=?, totp_enabled=1, updated_at=? WHERE id=?`,
+		secret, now, userID,
+	); err != nil {
+		return fmt.Errorf("enable TOTP: %w", err)
+	}
+
+	if _, err := tx.Exec(`DELETE FROM backup_codes WHERE user_id=?`, userID); err != nil {
+		return fmt.Errorf("clear backup codes: %w", err)
+	}
+	for _, h := range hashedCodes {
+		if _, err := tx.Exec(
+			`INSERT INTO backup_codes (id, user_id, code_hash) VALUES (?,?,?)`,
+			newID(), userID, h,
+		); err != nil {
+			return fmt.Errorf("insert backup code: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit EnableTOTP: %w", err)
+	}
+
+	// Update memory cache atomically after the DB transaction succeeds.
+	s.usersMu.Lock()
+	if u, ok := s.users[userID]; ok {
+		u.TOTPSecret  = secret
+		u.TOTPEnabled = true
+		u.UpdatedAt   = now
+	}
+	s.usersMu.Unlock()
+	return nil
+}
+
+// DisableTOTP atomically clears the TOTP secret, disables the flag, and
+// removes all backup codes for userID. Used by super_admin for account recovery.
+func (s *Store) DisableTOTP(userID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	now := time.Now().UTC()
+	if _, err := tx.Exec(
+		`UPDATE users SET totp_secret='', totp_enabled=0, updated_at=? WHERE id=?`,
+		now, userID,
+	); err != nil {
+		return fmt.Errorf("clear TOTP secret: %w", err)
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM backup_codes WHERE user_id=?`, userID,
+	); err != nil {
+		return fmt.Errorf("clear backup codes: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit DisableTOTP: %w", err)
+	}
+
+	s.usersMu.Lock()
+	if u, ok := s.users[userID]; ok {
+		u.TOTPSecret  = ""
+		u.TOTPEnabled = false
+		u.UpdatedAt   = now
+	}
+	s.usersMu.Unlock()
 	return nil
 }
 
@@ -449,6 +586,56 @@ func (s *Store) ResetFailedLogin(userID string) error {
 		updatedAt, userID,
 	)
 	return err
+}
+
+// ─── Dev Mode ─────────────────────────────────────────────────────────────────
+
+// DevTOTPSecret is the fixed TOTP secret injected on the admin account when the
+// daemon starts in dev mode (FALX_DEV=1 / --dev). Never changes between restarts,
+// so any TOTP app seeded with this key stays in sync indefinitely.
+// PRODUCTION: this constant must never appear in a prod config or log.
+const DevTOTPSecret = "KVKVEU2HKVKTEMKS"
+
+// DevModeBootstrap is called on startup when FALX_DEV=1.
+// It performs three operations atomically in the DB, then syncs the in-memory cache:
+//  1. Clears locked=1 and failed_attempts on every user account.
+//  2. Forces the "admin" account to use DevTOTPSecret with totp_enabled=1.
+// This lets developers restart the daemon and immediately log in using the
+// printed 6-digit code without touching the database manually.
+func (s *Store) DevModeBootstrap() error {
+	now := time.Now().UTC()
+
+	// 1. Unlock all accounts and reset failed-attempt counters.
+	if _, err := s.db.Exec(
+		`UPDATE users SET locked=0, failed_attempts=0, updated_at=?`, now,
+	); err != nil {
+		return fmt.Errorf("dev bootstrap: clear locks: %w", err)
+	}
+
+	// 2. Pin admin TOTP to the well-known dev secret.
+	if _, err := s.db.Exec(
+		`UPDATE users SET totp_secret=?, totp_enabled=1, updated_at=? WHERE username='admin'`,
+		DevTOTPSecret, now,
+	); err != nil {
+		return fmt.Errorf("dev bootstrap: set admin TOTP: %w", err)
+	}
+
+	// 3. Sync in-memory cache.
+	s.usersMu.Lock()
+	for _, u := range s.users {
+		u.Locked         = false
+		u.FailedAttempts = 0
+		u.UpdatedAt      = now
+	}
+	if id, ok := s.byName["admin"]; ok {
+		if u, ok := s.users[id]; ok {
+			u.TOTPSecret  = DevTOTPSecret
+			u.TOTPEnabled = true
+		}
+	}
+	s.usersMu.Unlock()
+
+	return nil
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────

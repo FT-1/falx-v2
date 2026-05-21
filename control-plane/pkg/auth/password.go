@@ -5,7 +5,7 @@
 //              Uses Argon2id (RFC 9106) — the winner of the Password Hashing
 //              Competition. Memory-hard and resistant to GPU/ASIC attacks.
 //
-//              Parameters (OWASP recommended for 2024):
+//              Parameters (OWASP recommended for 2026):
 //                Memory:      64 MiB (65536 KiB)
 //                Iterations:  3
 //                Parallelism: 2
@@ -47,26 +47,18 @@ var defaultArgon2Params = argon2Params{
 }
 
 // ─── Hash ─────────────────────────────────────────────────────────────────────
-// HashPassword derives an Argon2id hash from a plaintext password.
-// Returns a self-describing encoded string safe for storage.
-func HashPassword(password string) (string, error) {
-	if len(password) < 12 {
-		return "", errors.New("password must be at least 12 characters")
-	}
-	if len(password) > 128 {
-		return "", errors.New("password exceeds maximum length")
-	}
-
+// argon2idHash is the raw Argon2id primitive with no length policy.
+// Used by HashPassword (after validation) and HashBackupCode (no policy needed).
+func argon2idHash(plaintext string) (string, error) {
 	p := defaultArgon2Params
 
-	// Cryptographically secure random salt
 	salt := make([]byte, p.saltLen)
 	if _, err := rand.Read(salt); err != nil {
 		return "", fmt.Errorf("salt generation: %w", err)
 	}
 
 	hash := argon2.IDKey(
-		[]byte(password),
+		[]byte(plaintext),
 		salt,
 		p.iterations,
 		p.memory,
@@ -74,17 +66,34 @@ func HashPassword(password string) (string, error) {
 		p.keyLen,
 	)
 
-	// Encode in PHC string format
 	b64salt := base64.RawStdEncoding.EncodeToString(salt)
 	b64hash := base64.RawStdEncoding.EncodeToString(hash)
-
-	encoded := fmt.Sprintf(
+	return fmt.Sprintf(
 		"$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
 		argon2.Version,
 		p.memory, p.iterations, p.parallelism,
 		b64salt, b64hash,
-	)
-	return encoded, nil
+	), nil
+}
+
+// HashPassword derives an Argon2id hash from a plaintext password.
+// Enforces user-password length policy before hashing.
+// Do NOT use for backup codes — call HashBackupCode instead.
+func HashPassword(password string) (string, error) {
+	if len(password) < 12 {
+		return "", errors.New("password must be at least 12 characters")
+	}
+	if len(password) > 128 {
+		return "", errors.New("password exceeds maximum length")
+	}
+	return argon2idHash(password)
+}
+
+// HashBackupCode hashes a single TOTP backup code using Argon2id without
+// applying user-password length constraints. Backup codes are intentionally
+// shorter than user passwords and must not be routed through HashPassword.
+func HashBackupCode(code string) (string, error) {
+	return argon2idHash(code)
 }
 
 // ─── Verify ───────────────────────────────────────────────────────────────────
