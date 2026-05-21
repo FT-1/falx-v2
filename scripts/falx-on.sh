@@ -71,6 +71,39 @@ PY
     echo ""
 }
 
+# print_login_box — auto-detect the dashboard URL + default credentials and print
+# them in one clear panel. The dashboard (HTTP/WS) listens on :8080 — note that
+# :50052 is the internal gRPC port, NOT the web UI. The default admin password is
+# random (FLX-<hex>!) and emitted once to the SOC log on first admin creation;
+# we scrape the most recent one. Printed ABOVE the 2FA box.
+print_login_box() {
+    local soc_log="$1" iface ip pass url
+
+    # Active interface: prefer falx.toml iface, fall back to the default-route NIC.
+    iface=$(grep -E '^[[:space:]]*iface[[:space:]]*=' "$FALX_CONF" 2>/dev/null | head -1 \
+            | sed -E 's/.*"([^"]+)".*/\1/')
+    [[ -z "$iface" ]] && iface=$(ip route get 8.8.8.8 2>/dev/null \
+            | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1);exit}}')
+
+    ip=$(ip -4 -o addr show dev "$iface" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [[ -z "$ip" ]] && ip="localhost"
+    url="http://${ip}:8080"
+
+    # Default admin password: logged once as "temp_password":"FLX-<12 hex>!".
+    pass=$(grep -aoE 'FLX-[0-9a-f]{12}!' "$soc_log" 2>/dev/null | tail -1)
+    [[ -z "$pass" ]] && pass="(تم تغييرها — راجع سجل أول تشغيل)"
+
+    echo ""
+    echo -e "${B}${C}  ╔══════════════════════════════════════════════════════════╗${N}"
+    echo -e "${B}${C}  ║                  بيانات الدخول إلى FALX V2                ║${N}"
+    echo -e "${B}${C}  ╠══════════════════════════════════════════════════════════╣${N}"
+    printf  "${B}${C}  ║${N}  🌐  Dashboard : ${G}%-40s${N}${B}${C}║${N}\n" "$url"
+    printf  "${B}${C}  ║${N}  👤  Username  : ${G}%-40s${N}${B}${C}║${N}\n" "admin"
+    printf  "${B}${C}  ║${N}  🔑  Password  : ${G}%-40s${N}${B}${C}║${N}\n" "$pass"
+    echo -e "${B}${C}  ╚══════════════════════════════════════════════════════════╝${N}"
+}
+
 [[ $EUID -ne 0 ]] && { echo -e "${R}Run as root:${N}  sudo bash scripts/falx-on.sh"; exit 1; }
 
 # ─── Args ─────────────────────────────────────────────────────────────────────
@@ -258,6 +291,8 @@ if [[ "$ALIVE" == true ]]; then
     echo -e "  falx-user PID ${B}${FALX_USER_PID}${N}   ${C}tail -f ${USER_LOG}${N}   (XDP datapath)"
     echo -e "  falxd     PID ${B}${FALXD_PID}${N}   ${C}tail -f ${FALXD_LOG}${N}"
     echo -e "  falx-soc  PID ${B}${SOC_PID}${N}   ${C}tail -f ${SOC_LOG}${N}"
+    # Full login panel (URL + credentials), then the live 2FA box right below it.
+    print_login_box "$SOC_LOG"
     if [[ "$DEV_MODE" == "1" ]]; then
         print_2fa_box "$SOC_LOG"
     fi
