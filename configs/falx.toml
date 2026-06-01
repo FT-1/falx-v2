@@ -8,7 +8,7 @@
 
 [general]
 log_level = "info"          # trace | debug | info | warn | error
-iface     = "eth0"          # Primary interface for XDP attachment
+iface     = "ens160"        # Primary interface for XDP attachment (VMware vNIC = ens160)
 pin_path  = "/sys/fs/bpf/falx"  # BPF filesystem pin path
 
 # ─── XDP Data Plane ───────────────────────────────────────────────────────────
@@ -16,7 +16,8 @@ pin_path  = "/sys/fs/bpf/falx"  # BPF filesystem pin path
 # native  = requires driver support (e1000, mlx5, i40e, etc.) — FASTEST
 # skb     = generic mode, works on any driver, slower (~10% overhead)
 # offload = NIC hardware offload (requires SmartNIC support)
-mode = "native"
+# VMware vmxnet3 does NOT support native XDP → use skb on VMs.
+mode = "skb"
 
 # ─── BPF Map Configuration ────────────────────────────────────────────────────
 [maps]
